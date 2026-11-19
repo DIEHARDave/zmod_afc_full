@@ -213,6 +213,15 @@ class IFSBackend:
         """
         return self.unit.run_cmd(self.unit.load_cmd, lane, keep_temp=self.unit.keep_temp)
 
+    def eject(self, lane: AFCLane) -> Tuple[bool, str]:
+        """
+        Retract a lane's filament to its IFS slot.
+
+        :param lane: Lane to eject
+        :return Tuple[bool, str]: Success and error message
+        """
+        return self.unit.run_cmd(self.unit.eject_cmd, lane, keep_temp=self.unit.keep_temp)
+
 
 class ZmodBackend(IFSBackend):
     """
@@ -661,6 +670,37 @@ class ZmodBackend(IFSBackend):
         # at print start doesn't
         restore = 1 if getattr(self.sdcard, "change_filament", False) else 0
         return unit.run_cmd(unit.swap_cmd, lane, tool=tool, restore=restore)
+
+    def eject(self, lane: AFCLane) -> Tuple[bool, str]:
+        """
+        Eject a lane. Zmod's REMOVE_PRUTOK_IFS always unloads the head first,
+        so a lane that isn't in the head is retracted on its own: clamp,
+        retract the tube length, release, stop. No heat, no toolhead moves,
+        the filament in the head stays (as Kiln's IFS_EJECT of an idle lane).
+
+        :param lane: Lane to eject
+        :return Tuple[bool, str]: Success and error message
+        """
+        unit = self.unit
+        slot = unit.slot_of(lane)
+        head = unit.status().get("head_slot") or 0
+        if (head == slot
+                or self.zifs is None
+                or unit.eject_cmd != self.eject_cmd):   # eject_cmd set in the config
+            return unit.run_cmd(unit.eject_cmd, lane, keep_temp=unit.keep_temp)
+        length, speed = 1000, 1200
+        try:
+            config = self.zifs.get_prutok_config(slot)
+            length = int(config.get("filament_tube_length", length))
+            speed = int(config.get("filament_ifs_speed", speed))
+        except Exception:
+            unit.logger.debug(f"AFC_IFS: Zmod slot {slot} config unreadable, eject uses"
+                              f" {length} mm at {speed}\n{traceback.format_exc()}")
+        return unit.run_cmd("IFS_F24 PRUTOK={slot}\n"
+                            "IFS_F11 PRUTOK={slot} LEN={length} SPEED={speed}\n"
+                            "IFS_F39 PRUTOK={slot}\n"
+                            "IFS_F112",
+                            lane, length=length, speed=speed)
 
     cmd_AFC_IFS_HEAD_RUNOUT_help = "AFC_IFS: filament ran out at the head sensor"
 
@@ -1840,7 +1880,7 @@ class afcIFS(afcUnit):
         :param lane: Lane to eject
         """
         self.await_empty.add(lane.name)
-        ok, err = self.run_cmd(self.eject_cmd, lane, keep_temp=self.keep_temp)
+        ok, err = self.backend.eject(lane)
         if not ok:
             self.afc.error.AFC_error(f"IFS eject of {lane.name} failed: {err}", pause=False)
             return

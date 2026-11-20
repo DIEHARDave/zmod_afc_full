@@ -213,6 +213,24 @@ class IFSBackend:
         """
         return self.unit.run_cmd(self.unit.load_cmd, lane, keep_temp=self.unit.keep_temp)
 
+    def can_eject_in_print(self) -> bool:
+        """
+        Whether an idle lane can be ejected beside a running print, without
+        holding up the print's G-code.
+
+        :return bool: True when `eject_in_print` is available
+        """
+        return False
+
+    def eject_in_print(self, slot: int) -> Tuple[bool, str]:
+        """
+        Eject an idle slot from a reactor callback while a print runs.
+
+        :param slot: IFS slot to eject
+        :return Tuple[bool, str]: Success and error message
+        """
+        return False, "not supported by this firmware"
+
     def eject(self, lane: AFCLane) -> Tuple[bool, str]:
         """
         Retract a lane's filament to its IFS slot.
@@ -973,6 +991,38 @@ class KilnBackend(IFSBackend):
         return unit.run_cmd(unit.swap_cmd if swap else unit.load_cmd, lane,
                             keep_temp=unit.keep_temp)
 
+    def can_eject_in_print(self) -> bool:
+        """
+        A serial-mode IFS ejects an idle slot over its own link, without
+        toolhead moves. MCU mode (IFS Jacker) drives manual_steppers, which
+        queue behind the print's moves.
+
+        :return bool: True on a serial-mode IFS
+        """
+        ifs = self.ifs
+        return (ifs is not None
+                and getattr(ifs, "is_mcu_mode", True) is False
+                and callable(getattr(ifs, "_run", None))
+                and callable(getattr(ifs, "_eject", None)))
+
+    def eject_in_print(self, slot: int) -> Tuple[bool, str]:
+        """
+        Run IFS_EJECT's idle-slot path (`_eject` under Kiln's IFS mutex)
+        without waiting for the print's queued moves, so the print keeps
+        going. A tool change that comes meanwhile waits on the mutex.
+
+        :param slot: IFS slot to eject
+        :return Tuple[bool, str]: Success and error message
+        """
+        ifs = self.ifs
+        if slot == getattr(ifs, "channel", 0):
+            return False, f"slot {slot} is in the toolhead"
+        try:
+            ifs._run(ifs._eject, slot, op="eject", target=slot, wait=False)
+        except Exception as e:
+            return False, str(e)
+        return True, ""
+
     def on_ifs_loaded(self, slot: Optional[int]) -> None:
         """
         Kiln's `ifs:loaded` event, after every Kiln load, unload, swap and
@@ -1202,6 +1252,8 @@ class afcIFS(afcUnit):
         self.idle_map = config.getboolean("idle_map", True)
         # Kiln: mid-print changes as one IFS_SWAP
         self.use_swap = config.getboolean("use_swap", True)
+        # LANE_UNLOAD of an idle lane during a print, beside the print
+        self.print_eject = config.getboolean("print_eject", True)
         self.ifs_name = config.get("ifs", "ifs")
         self.head_sensor_name = config.get("head_sensor", "adc_filament_sensor toolhead")
         self.materials_name = config.get("materials", "ifs_materials")
@@ -1217,6 +1269,7 @@ class afcIFS(afcUnit):
         self.pending: Dict[str, Tuple[bool, int]] = {}
         self.head: Optional[Tuple[int, int]] = None
         self.await_empty: Set[str] = set()
+        self.print_ejecting: Set[str] = set()
         self.prep_seen: Optional[Tuple[float, Dict[int, bool]]] = None
         self.synced: Dict[int, Tuple[Material, Material]] = {}
         self.swap_from: Optional[str] = None
@@ -1333,7 +1386,110 @@ class afcIFS(afcUnit):
         Start the poll.
         """
         super().handle_ready()
+        if self.print_eject:
+            self.wrap_lane_unload()
         self.reactor.register_timer(self.poll_safe, self.reactor.monotonic() + self.poll_interval)
+
+    def wrap_lane_unload(self) -> None:
+        """
+        Put a handler in front of AFC's LANE_UNLOAD for this unit's lanes. AFC
+        refuses every eject while printing; the handler ejects an idle lane
+        beside the print when the backend can, and leaves the rest to AFC.
+        """
+        mux = getattr(self.gcode, "mux_commands", {}).get("LANE_UNLOAD")
+        if mux is None:
+            return
+        handlers = mux[1]
+        for lane in self.lanes.values():
+            orig = handlers.get(lane.name)
+            if orig is None or getattr(orig, "afc_ifs_print_eject", False):
+                continue
+
+            def handler(gcmd, lane=lane, orig=orig):
+                if not self.take_print_eject(lane):
+                    return orig(gcmd)
+                self.start_print_eject(lane)
+            handler.afc_ifs_print_eject = True
+            handlers[lane.name] = handler
+
+    def take_print_eject(self, lane: AFCLane) -> bool:
+        """
+        Whether LANE_UNLOAD of a lane is ours to run beside a print.
+
+        :param lane: Lane to eject
+        :return bool: True while printing, for an idle lane, when the backend can
+        """
+        extruder = lane.extruder_obj
+        return bool(self.afc.function.is_printing()
+                    and self.backend is not None
+                    and self.backend.can_eject_in_print()
+                    and not lane.tool_loaded
+                    and (extruder is None or extruder.lane_loaded != lane.name)
+                    and self.afc.function.get_current_lane() != lane.name)
+
+    def start_print_eject(self, lane: AFCLane) -> None:
+        """
+        Start an eject beside the print and return at once, so the print's
+        G-code keeps running. Refused while the IFS or AFC is busy.
+
+        :param lane: Idle lane to eject
+        """
+        slot = self.slot_of(lane)
+        if lane.name in self.print_ejecting:
+            self.gcode.respond_info(f"AFC_IFS: {lane.name} is already being ejected")
+            return
+        if (self.busy
+            or self.status().get("busy")
+            or self.afc.current_state not in ("Idle", None)):
+            self.afc.error.AFC_error(f"IFS is busy with a tool change; eject {lane.name}"
+                                     " again in a moment", pause=False)
+            return
+        tools = [t for t in (lane.map if isinstance(lane.map, list) else [lane.map]) if t]
+        if tools:
+            self.gcode.respond_info(
+                f"AFC_IFS: {lane.name} is still mapped to {', '.join(tools)}; a change to"
+                f" {'it' if len(tools) == 1 else 'them'} later in this print pauses on an"
+                " empty lane")
+        self.print_ejecting.add(lane.name)
+        self.await_empty.add(lane.name)
+        self.lane_unloading(lane)
+        lane.status = AFCLaneState.EJECTING
+        self.afc.save_vars()
+        self.gcode.respond_info(f"AFC_IFS: ejecting {lane.name} (IFS slot {slot}) beside"
+                                " the print")
+        self.reactor.register_callback(lambda eventtime: self.finish_print_eject(lane, slot))
+
+    def finish_print_eject(self, lane: AFCLane, slot: int) -> None:
+        """
+        Reactor callback: run the eject, then do LANE_UNLOAD's lane bookkeeping
+        (AFC's own state is left alone, a print is running).
+
+        :param lane: Lane being ejected
+        :param slot: Its IFS slot
+        """
+        try:
+            ok, err = self.backend.eject_in_print(slot)
+            self.pending.clear()
+            if not ok:
+                self.await_empty.discard(lane.name)
+                lane.status = AFCLaneState.LOADED if lane.prep_state else AFCLaneState.NONE
+                self.afc.save_vars()
+                self.afc.error.AFC_error(f"IFS eject of {lane.name} failed: {err}",
+                                         pause=False)
+                return
+            lane.loaded_to_hub = False
+            lane.status = AFCLaneState.NONE
+            self.afc.spool.set_spoolID(lane, None)
+            self.afc.save_vars()
+            self.lane_unloaded(lane)
+            self.logger.info(f"LANE {lane.name} eject done (beside the print)")
+            self.gcode.respond_info(f"AFC_IFS: {lane.name} - pull the filament out of IFS"
+                                    f" slot {slot}")
+        except Exception:
+            self.logger.error(f"AFC_IFS: eject of {lane.name} failed\n"
+                              f"{traceback.format_exc()}")
+        finally:
+            self.print_ejecting.discard(lane.name)
 
     def slot_of(self, lane: AFCLane) -> int:
         """

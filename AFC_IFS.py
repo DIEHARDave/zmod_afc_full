@@ -140,6 +140,9 @@ class IFSBackend:
     afc_runout = True        # AFC's runout path from the slot sensor
     keep_temp = False        # put the nozzle target back after an idle move
     calibration_hint = ""
+    # A runout waits for the strand's end to pass the toolhead sensor
+    # (the IFS can't pull back a tail that has left its slot)
+    waits_for_tail = False
 
     def __init__(self, unit: afcIFS):
         """
@@ -221,6 +224,37 @@ class IFSBackend:
         :return bool: True when `eject_in_print` is available
         """
         return False
+
+    def follow_runout(self, old_slot: int, change: AFCLane) -> None:
+        """
+        After an infinite-spool change, point the firmware's tools for the
+        empty slot at the new lane's slot.
+
+        :param old_slot: Slot that ran out
+        :param change: Lane the print changed to
+        """
+
+    def backup_slots(self, slot: int) -> List[int]:
+        """
+        Slots with the same filament as a slot, best first: same material and
+        color in AFC's lanes.
+
+        :param slot: Slot that ran out
+        :return List[int]: Backup slots
+        """
+        unit = self.unit
+        lane = unit.lane_for_slot(slot)
+        if lane is None or not lane.material or not lane.color:
+            return []
+        want = (str(lane.material).lower(), str(lane.color).lower())
+        return [unit.slot_of(other) for other in unit.lanes.values()
+                if other is not lane
+                and (str(other.material).lower(), str(other.color).lower()) == want]
+
+    def stand_down_refill(self) -> None:
+        """
+        Keep the firmware's own runout refill from acting while AFC changes lanes.
+        """
 
     def eject_in_print(self, slot: int) -> Tuple[bool, str]:
         """
@@ -849,6 +883,7 @@ class KilnBackend(IFSBackend):
     # Kiln's cut, unload, load and flush in one
     swap_cmd = "IFS_SWAP CHANNEL={slot}"
     calibration_hint = " (Kiln: IFS_TUNE)"
+    waits_for_tail = True
 
     def __init__(self, unit: afcIFS):
         """
@@ -1022,6 +1057,77 @@ class KilnBackend(IFSBackend):
         except Exception as e:
             return False, str(e)
         return True, ""
+
+    def follow_runout(self, old_slot: int, change: AFCLane) -> None:
+        """
+        Kiln's tool map: the tools on the empty slot go to the new lane's slot
+        (as Kiln's auto-refill does), so it agrees with AFC's swapped mapping.
+
+        :param old_slot: Slot that ran out
+        :param change: Lane the print changed to
+        """
+        unit = self.unit
+        new_slot = unit.slot_of(change)
+        tool_map = getattr(self.ifs, "tool_map", None)
+        if isinstance(tool_map, dict):
+            pairs = [(int(t), s) for t, s in tool_map.items()]
+        elif isinstance(tool_map, (list, tuple)):
+            # Kiln keeps a list: tool n -> slot
+            pairs = list(enumerate(tool_map))
+        else:
+            return
+        tools = sorted(t for t, s in pairs if s == old_slot)
+        for tool in tools:
+            cmd = f"IFS_MAP_TOOL TOOL={tool} SLOT={new_slot}"
+            try:
+                unit.gcode.run_script_from_command(cmd)
+            except Exception as e:
+                unit.logger.info(f"AFC_IFS: {cmd} failed: {e}")
+        if tools:
+            unit.logger.info(f"AFC_IFS: Kiln tools {', '.join(f'T{t}' for t in tools)}"
+                             f" now on slot {new_slot}")
+
+    def backup_slots(self, slot: int) -> List[int]:
+        """
+        Kiln's auto-refill candidates for a slot, by its MATCH= setting (exact,
+        similar or any), nearest color first: the same choice Kiln's refill
+        makes for a slot that just ran out. printer.ifs.refill_backups lists
+        only slots that still have filament, so it is no use here. Without
+        Kiln's matcher, AFC's lanes.
+
+        :param slot: Slot that ran out
+        :return List[int]: Backup slots
+        """
+        ifs = self.ifs
+        candidates = getattr(ifs, "_refill_candidates", None)
+        if callable(candidates):
+            try:
+                present = ifs.get_status(self.unit.reactor.monotonic()).get(
+                    "loaded_channels") or []
+                return [int(s) for s in candidates(slot, list(present))]
+            except Exception:
+                self.unit.logger.debug(f"AFC_IFS: Kiln refill match failed\n"
+                                       f"{traceback.format_exc()}")
+        return super().backup_slots(slot)
+
+    def stand_down_refill(self) -> None:
+        """
+        auto_runout: AFC_IFS changes lanes on a runout, so Kiln's auto-refill
+        (an IFS_SWAP as soon as the slot reads empty) is skipped. Its setting
+        and backups list stay as they are.
+        """
+        ifs = self.ifs
+        check = getattr(ifs, "_check_refill", None)
+        if not callable(check) or getattr(check, "afc_ifs_skip", False):
+            return
+
+        def skip(eventtime):
+            return None
+        skip.afc_ifs_skip = True
+        ifs._check_refill = skip
+        if getattr(ifs, "auto_refill", False):
+            self.unit.logger.info("AFC_IFS: Kiln's auto-refill is on; with auto_runout the"
+                                  " runout change is AFC's, Kiln's own swap is skipped")
 
     def on_ifs_loaded(self, slot: Optional[int]) -> None:
         """
@@ -1254,6 +1360,12 @@ class afcIFS(afcUnit):
         self.use_swap = config.getboolean("use_swap", True)
         # LANE_UNLOAD of an idle lane during a print, beside the print
         self.print_eject = config.getboolean("print_eject", True)
+        # Kiln: on a slot runout, print the rest of the strand and change
+        # when its end passes the toolhead sensor
+        self.tail_runout = config.getboolean("tail_runout", True)
+        # A runout with no ready runout lane picks a loaded lane with the same
+        # filament (Kiln: its auto-refill matches, MATCH=exact|similar|any)
+        self.auto_runout = config.getboolean("auto_runout", True)
         self.ifs_name = config.get("ifs", "ifs")
         self.head_sensor_name = config.get("head_sensor", "adc_filament_sensor toolhead")
         self.materials_name = config.get("materials", "ifs_materials")
@@ -1270,6 +1382,8 @@ class afcIFS(afcUnit):
         self.head: Optional[Tuple[int, int]] = None
         self.await_empty: Set[str] = set()
         self.print_ejecting: Set[str] = set()
+        self.tail_lane: Optional[str] = None
+        self.head_runout_hooked = False
         self.prep_seen: Optional[Tuple[float, Dict[int, bool]]] = None
         self.synced: Dict[int, Tuple[Material, Material]] = {}
         self.swap_from: Optional[str] = None
@@ -1388,6 +1502,13 @@ class afcIFS(afcUnit):
         super().handle_ready()
         if self.print_eject:
             self.wrap_lane_unload()
+        if getattr(self.backend, "waits_for_tail", False):
+            self.gcode.register_command("_AFC_IFS_TAIL_RUNOUT", self.cmd_AFC_IFS_TAIL_RUNOUT,
+                                        desc=self.cmd_AFC_IFS_TAIL_RUNOUT_help)
+            if self.tail_runout:
+                self.hook_head_runout()
+            if self.auto_runout:
+                self.backend.stand_down_refill()
         self.reactor.register_timer(self.poll_safe, self.reactor.monotonic() + self.poll_interval)
 
     def wrap_lane_unload(self) -> None:
@@ -1411,6 +1532,174 @@ class afcIFS(afcUnit):
                 self.start_print_eject(lane)
             handler.afc_ifs_print_eject = True
             handlers[lane.name] = handler
+
+    def hook_head_runout(self) -> None:
+        """
+        Kiln: put a handler in front of the toolhead sensor's runout event, so a
+        slot runout can wait for the strand's end to reach the head.
+        """
+        backend = self.backend
+        if not getattr(backend, "waits_for_tail", False):
+            return
+        sensor = getattr(backend, "head_sensor", None)
+        helper = getattr(sensor, "runout_helper", None)
+        if (helper is None
+            or not callable(getattr(helper, "_runout_event_handler", None))):
+            self.logger.info(f"AFC_IFS: no runout helper on {self.head_sensor_name}; a slot"
+                             " runout changes lanes at once")
+            return
+        if getattr(helper, "afc_ifs_tail", False):
+            self.head_runout_hooked = True
+            return
+        orig = helper._runout_event_handler
+
+        def handler(eventtime):
+            lane = self.take_tail_runout()
+            if lane is None:
+                return orig(eventtime)
+            self.head_runout(helper, lane)
+        helper._runout_event_handler = handler
+        helper.afc_ifs_tail = True
+        self.head_runout_hooked = True
+
+    def handle_runout(self, lane: AFCLane) -> bool:
+        """
+        AFC's unit hook for a slot runout of the lane in the toolhead. With the
+        head hook in place and the strand still in the head, the runout waits
+        for the head sensor: the IFS can't pull back a tail that has left its
+        slot, so the change cut and retract would fail.
+
+        Without the head hook, or with the head already empty, the runout runs
+        at once, still through `_AFC_IFS_TAIL_RUNOUT` so auto_runout picks the
+        lane.
+
+        :param lane: Lane whose slot ran empty
+        :return bool: True when this unit handles the runout
+        """
+        if not getattr(self.backend, "waits_for_tail", False):
+            return False
+        change = self.runout_target(lane)
+        then = f"changes to {change.name}" if change is not None else "pauses"
+        if (self.head_runout_hooked
+            and self.status().get("head_sensor") is not False):
+            self.tail_lane = lane.name
+            self.gcode.respond_info(f"AFC_IFS: {lane.name} ran out; printing the rest of the"
+                                    f" strand, the print {then} when its end passes the"
+                                    " toolhead sensor")
+            self.logger.info(f"AFC_IFS: {lane.name} slot runout, waiting for the toolhead"
+                             " sensor")
+            return True
+        self.gcode.respond_info(f"AFC_IFS: {lane.name} ran out; the print {then}")
+
+        def run(eventtime):
+            try:
+                self.afc.error.pause_resume.send_pause_command()
+                self.gcode.run_script(f"_AFC_IFS_TAIL_RUNOUT LANE={lane.name}")
+            except Exception:
+                self.logger.error(f"AFC_IFS: runout of {lane.name} failed\n"
+                                  f"{traceback.format_exc()}")
+        self.reactor.register_callback(run)
+        return True
+
+    def runout_target(self, lane: AFCLane) -> Optional[AFCLane]:
+        """
+        Lane a runout changes to: the lane's runout lane when it is ready, else
+        (auto_runout) a loaded lane of this unit with the same filament, as the
+        backend matches it. A runout lane that isn't ready is still returned
+        when nothing matches, so AFC reports it.
+
+        :param lane: Lane that ran out
+        :return Optional[AFCLane]: Lane to change to, None to pause
+        """
+        def ready(cand: Optional[AFCLane]) -> bool:
+            return (cand is not None
+                    and cand is not lane
+                    and bool(cand.prep_state)
+                    and cand.status == AFCLaneState.LOADED)
+        explicit = self.afc.lanes.get(lane.runout_lane) if lane.runout_lane else None
+        if ready(explicit):
+            return explicit
+        if self.auto_runout and self.backend is not None:
+            for slot in self.backend.backup_slots(self.slot_of(lane)):
+                cand = self.lane_for_slot(slot)
+                if ready(cand):
+                    return cand
+        return explicit
+
+    def take_tail_runout(self) -> Optional[AFCLane]:
+        """
+        The lane a head runout belongs to: the one whose slot ran out, still in
+        the toolhead, in a print. Clears the wait.
+
+        :return Optional[AFCLane]: Lane, or None to let the sensor's own handling run
+        """
+        name, self.tail_lane = self.tail_lane, None
+        lane = self.lanes.get(name) if name else None
+        if (lane is None
+            or not self.afc.function.in_print()
+            or self.afc.function.get_current_lane() != lane.name):
+            return None
+        return lane
+
+    def head_runout(self, helper: Any, lane: AFCLane) -> None:
+        """
+        Reactor callback for the head sensor's runout: pause at once (as
+        Klipper's runout handling does from an event) and run AFC's runout
+        for the lane as G-code.
+
+        :param helper: The toolhead sensor's RunoutHelper
+        :param lane: Lane whose strand just left the head sensor
+        """
+        try:
+            self.logger.info(f"AFC_IFS: end of {lane.name} passed the toolhead sensor")
+            self.afc.error.pause_resume.send_pause_command()
+            self.gcode.run_script(f"_AFC_IFS_TAIL_RUNOUT LANE={lane.name}")
+        except Exception:
+            self.logger.error(f"AFC_IFS: runout of {lane.name} failed\n"
+                              f"{traceback.format_exc()}")
+        finally:
+            helper.min_event_systime = self.reactor.monotonic() + helper.event_delay
+
+    cmd_AFC_IFS_TAIL_RUNOUT_help = "AFC_IFS: a runout strand's end passed the toolhead sensor"
+
+    def cmd_AFC_IFS_TAIL_RUNOUT(self, gcmd: GCodeCommand) -> None:
+        """
+        AFC's runout for a lane once its strand has left the toolhead sensor:
+        infinite spool to its runout lane, else AFC's runout pause. Run by the
+        head sensor hook.
+
+        Usage
+        -------
+        `_AFC_IFS_TAIL_RUNOUT LANE=<lane>`
+
+        Example
+        -------
+        ```
+        _AFC_IFS_TAIL_RUNOUT LANE=lane1
+        ```
+        """
+        lane = self.lanes.get(gcmd.get("LANE"))
+        if lane is None:
+            raise gcmd.error(f"AFC_IFS: {gcmd.get('LANE')} is not an {self.name} lane")
+        change = self.runout_target(lane)
+        if change is None:
+            lane._perform_pause_runout()
+            return
+        if change.name != lane.runout_lane:
+            self.logger.info(f"AFC_IFS: auto runout {lane.name} -> {change.name} (same"
+                             " filament)")
+        # AFC's infinite spool changes to lane.runout_lane; the lane's own
+        # setting is put back after
+        saved = lane.runout_lane
+        lane.runout_lane = change.name
+        try:
+            lane._perform_infinite_runout()
+        finally:
+            lane.runout_lane = saved
+        if (change is not None
+            and not self.afc.error_state
+            and self.afc.function.get_current_lane() == change.name):
+            self.backend.follow_runout(self.slot_of(lane), change)
 
     def take_print_eject(self, lane: AFCLane) -> bool:
         """
@@ -1591,6 +1880,9 @@ class afcIFS(afcUnit):
         :return float: Next wake time
         """
         wake = eventtime + self.poll_interval
+        if (self.tail_lane is not None
+            and not self.afc.function.in_print()):
+            self.tail_lane = None
         if (self.busy
             or self.backend is None
             or not self.prepped()
@@ -2035,6 +2327,16 @@ class afcIFS(afcUnit):
 
         :param lane: Lane to eject
         """
+        slot = self.slot_of(lane)
+        st = self.status()
+        if (st.get("connected")
+            and not (st.get("slots") or {}).get(slot, {}).get("present")):
+            # A runout: nothing left in the slot to pull back. A lane still in
+            # the nozzle (its unload folded into the next IFS_SWAP) is taken
+            # out by that swap; ejecting here would unload it twice.
+            self.logger.info(f"AFC_IFS: {lane.name} - IFS slot {slot} is empty, nothing to"
+                             " eject")
+            return
         self.await_empty.add(lane.name)
         ok, err = self.backend.eject(lane)
         if not ok:

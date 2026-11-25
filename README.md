@@ -30,7 +30,7 @@ version has passed the emulator suite and is being tested on hardware now.
    ```ini
    [update_manager zmod_afc_full]
    type: git_repo
-   channel: dev
+   channel: stable
    path: /root/printer_data/config/mod_data/plugins/zmod_afc_full
    origin: https://github.com/DIEHARDave/zmod_afc_full.git
    is_system_service: False

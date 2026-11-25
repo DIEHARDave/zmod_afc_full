@@ -797,14 +797,14 @@ class ZmodBackend(IFSBackend):
                  and change.status == AFCLaneState.LOADED)
         lane.status = AFCLaneState.NONE
         if not ready:
-            unit.lane_not_ready(lane)
+            unit.lane_not_ready(lane, gcmd=gcmd)
             if change is None:
                 why = "runout lane is not set"
             else:
                 why = f"runout lane {change.name} is not ready"
             afc.error.AFC_error(f"Runout triggered for lane {lane.name} and {why}. Load the"
                                 " next spool into the toolhead, then hit resume to continue.",
-                                pause=False)
+                                pause=False, gcmd=gcmd)
             return
         unit.logger.info(f"Infinite Spool triggered for {lane.name} -> {change.name}")
         tool = getattr(self.sdcard, "print_channel", None)
@@ -813,7 +813,7 @@ class ZmodBackend(IFSBackend):
         # Not INFINITE_RUNOUT: on one extruder that only makes AFC eject the
         # empty slot, which Zmod takes out itself
         try:
-            afc.CHANGE_TOOL(change, restore_pos=False)
+            afc.CHANGE_TOOL(change, restore_pos=False, gcmd=gcmd)
         finally:
             self.runout_tool = None
         if afc.error_state:
@@ -831,7 +831,7 @@ class ZmodBackend(IFSBackend):
                 self.atomic_write(self.file_config, json.dumps(new, indent=2))
         self.map_mtime, self.map_agreed = self.read_map()
         unit.logger.info(f"AFC_IFS: {', '.join(tools) or f'T{runout_tool}'} now on {change.name}")
-        unit.lane_not_ready(lane)
+        unit.lane_not_ready(lane, gcmd=gcmd)
         unit.gcode.run_script_from_command("RESUME")
 
 
@@ -1529,7 +1529,7 @@ class afcIFS(afcUnit):
             def handler(gcmd, lane=lane, orig=orig):
                 if not self.take_print_eject(lane):
                     return orig(gcmd)
-                self.start_print_eject(lane)
+                self.start_print_eject(lane, gcmd)
             handler.afc_ifs_print_eject = True
             handlers[lane.name] = handler
 
@@ -1562,7 +1562,7 @@ class afcIFS(afcUnit):
         helper.afc_ifs_tail = True
         self.head_runout_hooked = True
 
-    def handle_runout(self, lane: AFCLane) -> bool:
+    def handle_runout(self, lane: AFCLane, gcmd: Any = "callback") -> bool:
         """
         AFC's unit hook for a slot runout of the lane in the toolhead. With the
         head hook in place and the strand still in the head, the runout waits
@@ -1683,7 +1683,7 @@ class afcIFS(afcUnit):
             raise gcmd.error(f"AFC_IFS: {gcmd.get('LANE')} is not an {self.name} lane")
         change = self.runout_target(lane)
         if change is None:
-            lane._perform_pause_runout()
+            lane._perform_pause_runout(gcmd=gcmd)
             return
         if change.name != lane.runout_lane:
             self.logger.info(f"AFC_IFS: auto runout {lane.name} -> {change.name} (same"
@@ -1693,7 +1693,7 @@ class afcIFS(afcUnit):
         saved = lane.runout_lane
         lane.runout_lane = change.name
         try:
-            lane._perform_infinite_runout()
+            lane._perform_infinite_runout(gcmd=gcmd)
         finally:
             lane.runout_lane = saved
         if (change is not None
@@ -1716,12 +1716,13 @@ class afcIFS(afcUnit):
                     and (extruder is None or extruder.lane_loaded != lane.name)
                     and self.afc.function.get_current_lane() != lane.name)
 
-    def start_print_eject(self, lane: AFCLane) -> None:
+    def start_print_eject(self, lane: AFCLane, gcmd: Any = "callback") -> None:
         """
         Start an eject beside the print and return at once, so the print's
         G-code keeps running. Refused while the IFS or AFC is busy.
 
         :param lane: Idle lane to eject
+        :param gcmd: The LANE_UNLOAD command
         """
         slot = self.slot_of(lane)
         if lane.name in self.print_ejecting:
@@ -1731,7 +1732,7 @@ class afcIFS(afcUnit):
             or self.status().get("busy")
             or self.afc.current_state not in ("Idle", None)):
             self.afc.error.AFC_error(f"IFS is busy with a tool change; eject {lane.name}"
-                                     " again in a moment", pause=False)
+                                     " again in a moment", pause=False, gcmd=gcmd)
             return
         tools = [t for t in (lane.map if isinstance(lane.map, list) else [lane.map]) if t]
         if tools:
@@ -1741,7 +1742,7 @@ class afcIFS(afcUnit):
                 " empty lane")
         self.print_ejecting.add(lane.name)
         self.await_empty.add(lane.name)
-        self.lane_unloading(lane)
+        self.lane_unloading(lane, gcmd=gcmd)
         lane.status = AFCLaneState.EJECTING
         self.afc.save_vars()
         self.gcode.respond_info(f"AFC_IFS: ejecting {lane.name} (IFS slot {slot}) beside"
@@ -1764,13 +1765,13 @@ class afcIFS(afcUnit):
                 lane.status = AFCLaneState.LOADED if lane.prep_state else AFCLaneState.NONE
                 self.afc.save_vars()
                 self.afc.error.AFC_error(f"IFS eject of {lane.name} failed: {err}",
-                                         pause=False)
+                                         pause=False, gcmd="callback")
                 return
             lane.loaded_to_hub = False
             lane.status = AFCLaneState.NONE
-            self.afc.spool.set_spoolID(lane, None)
+            self.afc.spool.set_spoolID(lane, None, gcmd="callback")
             self.afc.save_vars()
-            self.lane_unloaded(lane)
+            self.lane_unloaded(lane, gcmd="callback")
             self.logger.info(f"LANE {lane.name} eject done (beside the print)")
             self.gcode.respond_info(f"AFC_IFS: {lane.name} - pull the filament out of IFS"
                                     f" slot {slot}")
@@ -1964,7 +1965,7 @@ class afcIFS(afcUnit):
             self.logger.error(f"AFC_IFS: {lane.name} sensor change failed\n"
                               f"{traceback.format_exc()}")
 
-    def sync_tool(self, slot: int, now: bool = False) -> None:
+    def sync_tool(self, slot: int, now: bool = False, gcmd: Any = "callback") -> None:
         """
         Make AFC's toolhead lane match the firmware's slot in the head.
 
@@ -1993,7 +1994,7 @@ class afcIFS(afcUnit):
         if have is not None:
             self.logger.info(f"AFC_IFS: {have.name} left the toolhead outside AFC")
             self.left_head = have.name
-            have.set_tool_unloaded(normal_toolchange=True)
+            have.set_tool_unloaded(normal_toolchange=True, gcmd=gcmd)
             if have.prep_state:
                 have.status = AFCLaneState.LOADED
         if want is not None:
@@ -2001,7 +2002,7 @@ class afcIFS(afcUnit):
                              f" ({self.backend.name} slot {slot})")
             self.left_head = None
             want.loaded_to_hub = True
-            want.set_tool_loaded(normal_toolchange=True)
+            want.set_tool_loaded(normal_toolchange=True, gcmd=gcmd)
         self.afc.save_vars()
 
     def apply_slot(self, lane: AFCLane, entry: SlotState) -> None:
@@ -2129,7 +2130,7 @@ class afcIFS(afcUnit):
         return False
 
     def system_Test(self, cur_lane: AFCLane, delay: float, assignTcmd: bool,
-                    enable_movement: bool) -> bool:
+                    enable_movement: bool, gcmd: Any = "callback") -> bool:
         """
         PREP for an IFS lane: read the slot and the toolhead from the firmware.
 
@@ -2137,6 +2138,7 @@ class afcIFS(afcUnit):
         :param delay: Unused, the IFS has no lane motor
         :param assignTcmd: Whether to assign the lane's tool command
         :param enable_movement: Unused, the IFS has no lane motor
+        :param gcmd: The PREP command
         :return bool: True when the IFS answered
         """
         st = self.status()
@@ -2148,7 +2150,7 @@ class afcIFS(afcUnit):
         succeeded = bool(st.get("connected"))
         slot = self.slot_of(cur_lane)
         if succeeded:
-            msg = self.prep_lane(cur_lane, slot, st)
+            msg = self.prep_lane(cur_lane, slot, st, gcmd)
         else:
             msg = "<span class=error--text>IFS NOT CONNECTED</span>"
         if assignTcmd:
@@ -2172,13 +2174,15 @@ class afcIFS(afcUnit):
         cur_lane.set_afc_prep_done()
         return succeeded
 
-    def prep_lane(self, cur_lane: AFCLane, slot: int, st: Dict[str, Any]) -> str:
+    def prep_lane(self, cur_lane: AFCLane, slot: int, st: Dict[str, Any],
+                  gcmd: Any = "callback") -> str:
         """
         Set a lane's presence and toolhead state for PREP.
 
         :param cur_lane: Lane
         :param slot: IFS slot
         :param st: Current status
+        :param gcmd: The PREP command
         :return str: PREP message for the lane
         """
         sample = self.prep_presence()
@@ -2188,23 +2192,23 @@ class afcIFS(afcUnit):
         in_head = (st.get("head_slot") or 0) == slot
         if (in_head
             and not cur_lane.tool_loaded):
-            cur_lane.set_tool_loaded()
+            cur_lane.set_tool_loaded(gcmd=gcmd)
         elif (cur_lane.tool_loaded
               and not in_head):
-            cur_lane.set_tool_unloaded()
+            cur_lane.set_tool_unloaded(gcmd=gcmd)
         if not (present or in_head):
             if not cur_lane.remember_spool:
                 self.afc.spool.clear_values(cur_lane)
-            self.lane_not_ready(cur_lane)
+            self.lane_not_ready(cur_lane, gcmd=gcmd)
             return "EMPTY READY FOR SPOOL"
-        self.lane_loaded(cur_lane)
+        self.lane_loaded(cur_lane, gcmd=gcmd)
         cur_lane.status = AFCLaneState.LOADED
         msg = "<span class=success--text>LOCKED AND LOADED</span>"
         if in_head:
             cur_lane.loaded_to_hub = True
             cur_lane.status = AFCLaneState.TOOLED
             self.afc.spool.set_active_spool(cur_lane.spool_id)
-            self.lane_tool_loaded(cur_lane)
+            self.lane_tool_loaded(cur_lane, gcmd=gcmd)
             msg += "<span class=primary--text> in ToolHead</span>"
             self.printer.send_event("afc:tool_loaded", cur_lane)
         return msg
@@ -2262,12 +2266,14 @@ class afcIFS(afcUnit):
             self.pending.clear()
             self.head = None
 
-    def unit_load_lane(self, cur_lane: AFCLane, cur_extruder: Any) -> bool:
+    def unit_load_lane(self, cur_lane: AFCLane, cur_extruder: Any,
+                       gcmd: Any = "callback") -> bool:
         """
         Load a lane into the toolhead through the firmware (load_sequence's hook).
 
         :param cur_lane: Lane to load
         :param cur_extruder: Extruder object, unused
+        :param gcmd: The command the load runs under
         :return bool: True when the firmware reports the lane's slot in the head
         """
         swap = self.swap_from is not None
@@ -2281,21 +2287,23 @@ class afcIFS(afcUnit):
         if not ok:
             self.afc.error.handle_lane_failure(cur_lane,
                                                f"IFS load of {cur_lane.name} failed: {err}",
-                                               pause=self.afc.function.in_print())
-            self.sync_tool(head, now=True)
+                                               pause=self.afc.function.in_print(), gcmd=gcmd)
+            self.sync_tool(head, now=True, gcmd=gcmd)
             return False
         cur_lane.loaded_to_hub = True
         cur_lane.status = AFCLaneState.TOOL_LOADED
         self.afc.save_vars()
         return True
 
-    def unit_unload_lane(self, cur_lane: AFCLane, cur_extruder: Any) -> bool:
+    def unit_unload_lane(self, cur_lane: AFCLane, cur_extruder: Any,
+                         gcmd: Any = "callback") -> bool:
         """
         Unload a lane from the toolhead (unload_sequence's hook), or leave the
         unload to the next load when the firmware does both in one change.
 
         :param cur_lane: Lane to unload
         :param cur_extruder: Extruder object, unused
+        :param gcmd: The command the unload runs under
         :return bool: True when the lane left the toolhead
         """
         nxt = self.afc.next_lane_load
@@ -2312,20 +2320,22 @@ class afcIFS(afcUnit):
             if not ok:
                 self.afc.error.handle_lane_failure(cur_lane,
                                                    f"IFS unload of {cur_lane.name} failed: {err}",
-                                                   pause=self.afc.function.in_print())
+                                                   pause=self.afc.function.in_print(),
+                                                   gcmd=gcmd)
                 return False
         if self.afc.post_unload_macro is not None:
             self.gcode.run_script_from_command(self.afc.post_unload_macro)
-        cur_lane.set_tool_unloaded(normal_toolchange=True)
+        cur_lane.set_tool_unloaded(normal_toolchange=True, gcmd=gcmd)
         cur_lane.status = AFCLaneState.LOADED if cur_lane.prep_state else AFCLaneState.NONE
         self.afc.save_vars()
         return True
 
-    def eject_lane(self, lane: AFCLane) -> None:
+    def eject_lane(self, lane: AFCLane, gcmd: Any = "callback") -> None:
         """
         Retract a lane's filament to its IFS slot.
 
         :param lane: Lane to eject
+        :param gcmd: The command the eject runs under
         """
         slot = self.slot_of(lane)
         st = self.status()
@@ -2340,29 +2350,31 @@ class afcIFS(afcUnit):
         self.await_empty.add(lane.name)
         ok, err = self.backend.eject(lane)
         if not ok:
-            self.afc.error.AFC_error(f"IFS eject of {lane.name} failed: {err}", pause=False)
+            self.afc.error.AFC_error(f"IFS eject of {lane.name} failed: {err}", pause=False,
+                                     gcmd=gcmd)
             return
         self.gcode.respond_info(f"AFC_IFS: {lane.name} - pull the filament out of IFS slot"
                                 f" {self.slot_of(lane)}")
 
-    def lane_unload(self, cur_lane: AFCLane) -> bool:
+    def lane_unload(self, cur_lane: AFCLane, gcmd: Any = "callback") -> bool:
         """
         LANE_UNLOAD: eject the lane.
 
         :param cur_lane: Lane to unload
+        :param gcmd: The LANE_UNLOAD command
         :return bool: Always True
         """
-        self.eject_lane(cur_lane)
+        self.eject_lane(cur_lane, gcmd=gcmd)
         return True
 
-    def prep_load(self, lane: AFCLane) -> None:
+    def prep_load(self, lane: AFCLane, gcmd: Any = "callback") -> None:
         """
         The IFS loads from its slot itself.
 
         :param lane: Lane
         """
 
-    def prep_post_load(self, lane: AFCLane) -> None:
+    def prep_post_load(self, lane: AFCLane, gcmd: Any = "callback") -> None:
         """
         The IFS loads from its slot itself.
 
@@ -2397,7 +2409,8 @@ class afcIFS(afcUnit):
         hint = self.backend.calibration_hint if self.backend is not None else ""
         return f"The IFS needs no AFC calibration{hint}."
 
-    def calibrate_lane(self, cur_lane: AFCLane, tol: float) -> Tuple[bool, str, int]:
+    def calibrate_lane(self, cur_lane: AFCLane, tol: float,
+                       gcmd: Any = "callback") -> Tuple[bool, str, int]:
         """
         No lane calibration on the IFS.
 
@@ -2408,7 +2421,7 @@ class afcIFS(afcUnit):
         return False, self.calibration_lane_message(), 0
 
     def calibrate_bowden(self, cur_lane: AFCLane, dis: float,
-                         tol: float) -> Tuple[bool, str, int]:
+                         tol: float, gcmd: Any = "callback") -> Tuple[bool, str, int]:
         """
         No bowden calibration on the IFS.
 
@@ -2419,7 +2432,8 @@ class afcIFS(afcUnit):
         """
         return False, self.calibration_lane_message(), 0
 
-    def calibrate_hub(self, cur_lane: AFCLane, tol: float) -> Tuple[bool, str, int]:
+    def calibrate_hub(self, cur_lane: AFCLane, tol: float,
+                      gcmd: Any = "callback") -> Tuple[bool, str, int]:
         """
         No hub calibration on the IFS.
 
@@ -2429,7 +2443,8 @@ class afcIFS(afcUnit):
         """
         return False, self.calibration_lane_message(), 0
 
-    def calibrate_td1(self, cur_lane: AFCLane, dis: float, tol: float) -> Tuple[bool, str, int]:
+    def calibrate_td1(self, cur_lane: AFCLane, dis: float, tol: float,
+                      gcmd: Any = "callback") -> Tuple[bool, str, int]:
         """
         No TD-1 on the IFS.
 
@@ -2440,17 +2455,20 @@ class afcIFS(afcUnit):
         """
         return False, "TD-1 is not supported on IFS lanes", 0
 
-    def select_lane(self, lane: AFCLane, sel_prep: bool = False) -> Tuple[bool, int]:
+    def select_lane(self, lane: AFCLane, sel_dir: bool = False,
+                    disable_selector: bool = False, *,
+                    gcmd: Any = "callback") -> Tuple[bool, int]:
         """
         The IFS selects its slot itself.
 
         :param lane: Lane
-        :param sel_prep: Unused
+        :param sel_dir: Unused
+        :param disable_selector: Unused
         :return Tuple[bool, int]: Success
         """
         return True, 0
 
-    def return_to_home(self, prep: bool = False) -> bool:
+    def return_to_home(self, prep: bool = False, *, gcmd: Any = "callback") -> bool:
         """
         The IFS has no selector to home.
 

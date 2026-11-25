@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from configfile import ConfigWrapper
     from gcode import GCodeDispatch, GCodeCommand
     from extras.gcode_move import GCodeMove
+    from extras.homing import PrinterHoming
     from extras.AFC_lane import AFCLane
     from extras.AFC_extruder import AFCExtruder
     from extras.AFC_functions import afcFunction
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from extras.AFC_error import afcError
     from extras.AFC_stepper import AFCExtruderStepper
     from extras.AFC_unit import afcUnit
+    from extras.AFC_utils import AFCGcmd
 
 ERROR_STR = "Error trying to import {import_lib}, please rerun install-afc.sh script in your AFC-Klipper-Add-On directory then restart klipper\n\n{trace}"
 
@@ -58,7 +60,7 @@ except: raise error(ERROR_STR.format(import_lib="AFC_utils", trace=traceback.for
 try: from extras.AFC_stats import AFCStats
 except: raise error(ERROR_STR.format(import_lib="AFC_stats", trace=traceback.format_exc()))
 
-AFC_VERSION="1.2.12"
+AFC_VERSION="1.2.16"
 
 # Class for holding different states so its clear what all valid states are
 class State(str, Enum):
@@ -101,12 +103,20 @@ class afc:
         self.function.afc = self
         self.function.logger = self.logger
         self.gcode: GCodeDispatch = self.printer.load_object(config, 'gcode')
+        # Newer Kalico's run_script_from_command takes a gcmd and validates the
+        # mutex itself instead of racing; older Kalico/mainline Klipper don't.
+        try:
+            params = inspect.signature(self.gcode.run_script_from_command).parameters
+            self._rsfc_accepts_gcmd = "gcmd" in params
+        except (TypeError, ValueError):
+            self._rsfc_accepts_gcmd = False
 
         # Registering stepper callback so that mux macro can be set properly with valid lane names
         self.printer.register_event_handler("afc_stepper:register_macros",self.register_lane_macros)
         # Registering for sdcard reset file so that error_state can be reset when starting a print
         self.printer.register_event_handler("virtual_sdcard:reset_file", self._reset_file_callback)
-        self.printer.register_event_handler("extruder:activate_extruder", self.function.handle_activate_extruder)
+        self.printer.register_event_handler("extruder:activate_extruder",
+                                            self.function.handle_activate_extruder_cb)
         # Registering webhooks endpoint for <ip_address>/printer/afc/status
         self.webhooks.register_endpoint("afc/status", self._webhooks_status)
 
@@ -118,6 +128,7 @@ class afc:
         self.spoolman           = None
         self.moonraker: Optional[AFC_moonraker] = None
         self.print_data_metadata : Optional[AFC_PrintFileMetaData] = None
+        self.afc_stats: Optional[AFCStats] = None
         self.td1_defined        = False
         self._td1_present       = False
         self._last_td1_query:float    = 0
@@ -310,6 +321,7 @@ class afc:
         self.testing                = config.getboolean('testing', False)           # Set to true for testing only so that failure states can be tested without stats being reset
         self.enable_multiple_mapping = config.getboolean("enable_multiple_mapping",False)
         self.manual_home_has_probe_pos_param: bool = False
+        self.manual_home_requires_gcmd: bool = False
 
         # Klippy debuginput start_args can only be passed in when doing tests, this way AFC
         # knows if its running on a printer or a klippy test. This way we can bypass some
@@ -460,14 +472,10 @@ class afc:
         self.idle       = self.printer.lookup_object('idle_timeout')
         self.gcode_move: GCodeMove = self.printer.lookup_object('gcode_move')
 
-        # Looking up to see if manual_home has probe_pos, this is to make AFC work with klipper
-        # starting with new homing update git hash(57c2e0c960f8e25f56a66ba3a1e90e124f207001)
-        phoming = self.printer.lookup_object('homing')
-        try:
-            phoming_sig = inspect.signature(phoming.manual_home)
-            self.manual_home_has_probe_pos_param = True if "probe_pos" in phoming_sig.parameters.keys() else False
-        except:
-            pass
+        # Inspect manual_home's signature to detect optional/required parameters added
+        # by different Klipper/Kalico forks, so AFC passes the right keyword arguments.
+        phoming: PrinterHoming = self.printer.lookup_object('homing')
+        self._detect_manual_home_signature(phoming)
 
         # Check if hardware bypass is configured, if not create a virtual bypass sensor
         try:
@@ -494,6 +502,24 @@ class afc:
         self._rename_macros()
 
         self.current_state = State.IDLE
+
+    def _detect_manual_home_signature(self, phoming: PrinterHoming) -> None:
+        """
+        Inspect `manual_home`'s signature to detect optional/required parameters
+        added by different Klipper/Kalico forks, so AFC passes the right keyword
+        arguments when calling it. `probe_pos` was added by upstream Klipper's
+        probing-context homing update (git hash 57c2e0c), while Kalico PR #1052
+        made `gcmd` a required parameter so nested gcode contexts can be tracked.
+
+        :param phoming: the printer's `homing` object.
+        """
+        try:
+            sig_params = inspect.signature(phoming.manual_home).parameters
+        except (TypeError, ValueError):
+            return
+        self.manual_home_has_probe_pos_param = "probe_pos" in sig_params
+        self.manual_home_requires_gcmd = ("gcmd" in sig_params
+                                          and sig_params["gcmd"].default is inspect.Parameter.empty)
 
     def handle_ready(self):
         """
@@ -644,7 +670,7 @@ class afc:
         """
         self.in_print_timer = self.reactor.register_timer( self.in_print_reactor_timer, self.reactor.monotonic() + 5 )
         self.error.reset_failure()
-        self.gcode.run_script_from_command("CLEAR_PAUSE")
+        self.run_script('CLEAR_PAUSE', gcmd="sub_command")
         self.number_of_toolchanges = 0
         self.current_toolchange    = -1
         self.print_tool_temperatures = []
@@ -871,7 +897,7 @@ class afc:
         except Exception:
             self.logger.debug("Unable to restore extruder temperature")
 
-    def _set_display_status(self, variable: str, value: bool) -> None:
+    def _set_display_status(self, variable: str, value: bool, gcmd: AFCGcmd) -> None:
         """
         Best-effort notification of a display status change during tool-change
         actions (e.g. pushing new filament into the toolhead, retracting it back
@@ -883,11 +909,12 @@ class afc:
 
         :param variable: Name of the status variable that changed
         :param value: True/False the variable changed to
+        :param gcmd: command context to run the macro through, if any
         """
         if 'gcode_macro _AFC_DISPLAY_STATUS' in self.printer.objects:
             try:
-                self.gcode.run_script_from_command(
-                    f"_AFC_DISPLAY_STATUS VARIABLE={variable} VALUE={value}")
+                self.run_script(
+                    f"_AFC_DISPLAY_STATUS VARIABLE={variable} VALUE={value}", gcmd=gcmd)
             except Exception:
                 self.logger.debug("_AFC_DISPLAY_STATUS macro raised an error")
 
@@ -952,32 +979,62 @@ class afc:
 
         return bypass_state
 
-    def _check_bypass(self, unload=False):
+    def _check_bypass(self, unload: bool=False, *, gcmd: AFCGcmd) -> bool:
         """
         Helper function that checks if bypass has filament loaded
 
         :param unload: Set True if user is trying to unload, when set to True and filament is loaded AFC runs users renamed stock UNLOAD_FILAMENT macro
-        :return        Returns true if filament is present in sensor
+        :param gcmd: command context to run the unload macro through, if any
+        :return bool: Returns true if filament is present in sensor
         """
         try:
             if self.get_bypass_state():
                 if unload:
                     self.logger.info("Bypass detected, calling manual unload filament routine")
-                    self._set_display_status('retraction', True)
+                    self._set_display_status('retraction', True, gcmd=gcmd)
                     try:
-                        self.gcode.run_script_from_command(self.RENAMED_UNLOAD_FILAMENT)
+                        self.run_script(self.RENAMED_UNLOAD_FILAMENT, gcmd=gcmd)
                     finally:
-                        self._set_display_status('retraction', False)
+                        self._set_display_status('retraction', False, gcmd=gcmd)
                     self.logger.info("Filament unloaded")
                 else:
                     msg = "Filament loaded in bypass, not doing tool load"
                     # If printing report as error, only pause if in a print and bypass_pause variable is True
                     self.error.AFC_error(msg, pause=(self.function.in_print() and self.bypass_pause),
-                                         stack_name=inspect.currentframe().f_back.f_code.co_name)
+                                         stack_name=inspect.currentframe().f_back.f_code.co_name,
+                                         gcmd=gcmd)
                 return True
         except:
             pass
         return False
+
+    def run_script(self, script: str, gcmd: AFCGcmd) -> None:
+        """
+        Run a gcode script, acquiring the gcode mutex only if not already held.
+
+        :param script: gcode script to run
+        :param gcmd: command context the script is run through, or one of two
+            literals: `"callback"` for a true async context with no real
+            command (hardware/sensor callbacks, reactor timers, deferred
+            completion callbacks), or `"sub_command"` for an event handler
+            fired synchronously from inside another command's own gcode
+            context, which can't release the mutex until this call stack
+            returns to it
+        """
+        if gcmd == "sub_command":
+            # The caller guarantees the mutex is already held by its own
+            # enclosing synchronous command context.
+            self.gcode.run_script_from_command(script)
+        elif self._rsfc_accepts_gcmd:
+            # run_script_from_command() with no gcmd creates a legacy g-code
+            # context on new Kalico; a later recursive run_script call
+            # through that context hits the mutex error again.
+            if gcmd != "callback":
+                gcmd.run_script(script)
+            else:
+                self.gcode.run_script(script)
+        else:
+            self.gcode.run_script_from_command(script)
 
     cmd_AFC_TOGGLE_MACRO_help = "Enable/disable TOOL_CUT/PARK/POOP/KICK/WIPE/FORM_TIP macros"
     cmd_AFC_TOGGLE_MACRO_options = {"TOOL_CUT": {"type": "int", "default": 0},
@@ -1052,7 +1109,7 @@ class afc:
         UNSET_LANE_LOADED
         ```
         """
-        self.function.unset_lane_loaded()
+        self.function.unset_lane_loaded(gcmd)
 
     cmd_SET_AFC_TOOLCHANGES_help = "Sets number of toolchanges for AFC to keep track of"
     def cmd_SET_AFC_TOOLCHANGES(self, gcmd):
@@ -1113,13 +1170,14 @@ class afc:
         """
         force = gcmd.get_int('FORCE', 0) == 1
         if self.function.is_printing() and not force:
-            self.error.AFC_error("Cannot move lane while printer is printing", pause=False)
+            self.error.AFC_error("Cannot move lane while printer is printing",
+                                 pause=False, gcmd=gcmd)
             return
         lane = gcmd.get('LANE', None)
         distance = gcmd.get_float('DISTANCE', 0)
 
         if distance == 0:
-            self.error.AFC_error("Distance to move cannot be zero", pause=False)
+            self.error.AFC_error("Distance to move cannot be zero", pause=False, gcmd=gcmd)
             return
 
         if lane not in self.lanes:
@@ -1131,13 +1189,13 @@ class afc:
         speed_mode = SpeedMode.SHORT
         if abs(distance) >= 200: speed_mode = SpeedMode.LONG
 
-        cur_lane.set_load_current() # Making current is set correctly when doing lane moves
-        cur_lane.move_advanced(distance, speed_mode, assist_active = AssistActive.YES)
+        cur_lane.set_load_current(gcmd=gcmd) # Making current is set correctly when doing lane moves
+        cur_lane.move_advanced(distance, speed_mode, assist_active = AssistActive.YES, gcmd=gcmd)
         cur_lane.do_enable(False)
         self.current_state = State.IDLE
-        cur_lane.unit_obj.return_to_home()
+        cur_lane.unit_obj.return_to_home(gcmd=gcmd)
         # Put CAM back to lane if it is loaded to the toolhead
-        self.function.select_loaded_lane()
+        self.function.select_loaded_lane(gcmd=gcmd)
 
     def _get_resume_speed(self):
         """
@@ -1433,7 +1491,8 @@ class afc:
         """
         # TODO: Add a check to make sure hub is not already loaded
         if self.function.is_printing():
-            self.error.AFC_error("Cannot load lane to hub while printer is printing", pause=False)
+            self.error.AFC_error("Cannot load lane to hub while printer is printing",
+                                 pause=False, gcmd=gcmd)
             return
 
         lane = gcmd.get('LANE', None)
@@ -1450,30 +1509,30 @@ class afc:
                 cur_lane.move_to(cur_hub.move_dis, SpeedMode.SHORT,
                                  endstop=cur_lane.load_es,
                                  assist_active=AssistActive.DYNAMIC,
-                                 use_homing=self.homing_enabled)
+                                 use_homing=self.homing_enabled, gcmd=gcmd)
 
         if not cur_lane.loaded_to_hub:
             dist_to_hub = cur_lane.dist_hub
             if self.homing_enabled:
                 dist_to_hub = cur_lane.dist_hub + cur_hub.move_dis
             cur_lane.unit_obj.move_to_hub(cur_lane, dist_to_hub, MoveDirection.POS,
-                                          self.homing_enabled)
+                                          self.homing_enabled, gcmd=gcmd)
 
         while not cur_hub.state:
             # TODO: add timout routine here
             cur_lane.unit_obj.move_to_hub(cur_lane, cur_hub.move_dis, MoveDirection.POS,
-                                          self.homing_enabled)
+                                          self.homing_enabled, gcmd=gcmd)
 
         cur_lane.move_to(cur_hub.hub_clear_move_dis*MoveDirection.NEG, SpeedMode.HUB,
-                         assist_active=AssistActive.YES, use_homing=False)
+                         assist_active=AssistActive.YES, use_homing=False, gcmd=gcmd)
 
         cur_lane.status = AFCLaneState.NONE
         cur_lane.do_enable(False)
         cur_lane.loaded_to_hub = True
         self.save_vars()
-        cur_lane.unit_obj.return_to_home()
+        cur_lane.unit_obj.return_to_home(gcmd=gcmd)
         # Put CAM back to lane if its loaded to toolhead
-        self.function.select_loaded_lane()
+        self.function.select_loaded_lane(gcmd=gcmd)
 
     cmd_LANE_UNLOAD_help = "Unload lane from extruder"
     def cmd_LANE_UNLOAD(self, gcmd):
@@ -1493,7 +1552,8 @@ class afc:
 
         """
         if self.function.is_printing():
-            self.error.AFC_error("Cannot eject lane while printer is printing", pause=False)
+            self.error.AFC_error("Cannot eject lane while printer is printing",
+                                 pause=False, gcmd=gcmd)
             return
 
         lane = gcmd.get('LANE', None)
@@ -1501,9 +1561,9 @@ class afc:
             self.logger.info('{} Unknown'.format(lane))
             return
         cur_lane = self.lanes[lane]
-        self.LANE_UNLOAD( cur_lane )
+        self.LANE_UNLOAD( cur_lane, gcmd=gcmd )
 
-    def LANE_UNLOAD(self, cur_lane: AFCLane):
+    def LANE_UNLOAD(self, cur_lane: AFCLane, gcmd: AFCGcmd):
         """
         Ejects a lane's filament back out of the unit, when the lane is not in use.
 
@@ -1512,6 +1572,7 @@ class afc:
         raises, so a refused eject and a completed one look identical from the outside.
 
         :param cur_lane: AFCLane object for the lane to eject
+        :param gcmd: command context to run the current-change macro through, if any
         """
         # TODO: update this to unload from toolhead and move all the way back to load
         # when homing is enabled
@@ -1524,27 +1585,28 @@ class afc:
             # Setting status as ejecting so if filament is removed and de-activates the prep sensor while
             # extruder motors are still running it does not trigger infinite spool or pause logic
             # once user removes filament lanes status will go to None
-            cur_lane.unit_obj.lane_unloading(cur_lane)
+            cur_lane.unit_obj.lane_unloading(cur_lane, gcmd=gcmd)
             cur_lane.status = AFCLaneState.EJECTING
             self.save_vars()
 
             # Calling unit specific eject function
-            cur_lane.unit_obj.eject_lane(cur_lane)
+            cur_lane.unit_obj.eject_lane(cur_lane, gcmd=gcmd)
 
             cur_lane.loaded_to_hub = False
             cur_lane.status = AFCLaneState.NONE
-            cur_lane.unit_obj.return_to_home()
+            cur_lane.unit_obj.return_to_home(gcmd=gcmd)
             # Put CAM back to lane if its loaded to toolhead
-            self.function.select_loaded_lane()
+            self.function.select_loaded_lane(gcmd=gcmd)
             self.save_vars()
 
             # Removing spool from vars since it was ejected
-            self.spool.set_spoolID(cur_lane, None)
+            self.spool.set_spoolID(cur_lane, None, gcmd=gcmd)
             self.logger.info("LANE {} eject done".format(cur_lane.name))
-            cur_lane.unit_obj.lane_unloaded(cur_lane)
+            cur_lane.unit_obj.lane_unloaded(cur_lane, gcmd=gcmd)
         elif cur_lane.extruder_obj.is_standalone() and cur_lane.extruder_obj.lane_loaded:
             cur_lane.status = AFCLaneState.EJECTING
-            cur_lane.extruder_obj.load_unload_sequence(cur_lane.extruder_obj.tool_stn_unload*-1)
+            cur_lane.extruder_obj.load_unload_sequence(cur_lane.extruder_obj.tool_stn_unload*-1,
+                                                       gcmd=gcmd)
             self.save_vars()
 
         elif cur_lane.name == cur_lane.extruder_obj.lane_loaded:
@@ -1558,8 +1620,8 @@ class afc:
 
         self.current_state = State.IDLE
 
-    def do_poop_kick_wipe(self, cur_lane: AFCLane, cur_extruder: AFCExtruder,
-                          purge_length: Optional[float]=None):
+    def do_poop_kick_wipe(self, cur_lane: AFCLane, cur_extruder: AFCExtruder, *,
+                          purge_length: Optional[float]=None, gcmd: AFCGcmd):
         """
         Helper method for easily calling poop,kick,wipe macros. Macros only run if users have them
         enabled
@@ -1567,29 +1629,32 @@ class afc:
         :param cur_lane: Current lane that is in toolhead
         :param cur_extruder: Current active toolhead extruder
         :param purge_length: Length to purge filament
+        :param gcmd: command context to run the macros through, if any
         """
         if self.poop:
             if purge_length is not None:
-                self.gcode.run_script_from_command("{} PURGE_LENGTH={} EXTRUDER={}".format(self.poop_cmd, purge_length, cur_extruder.name))
+                self.run_script(
+                    f"{self.poop_cmd} PURGE_LENGTH={purge_length} EXTRUDER={cur_extruder.name}",
+                    gcmd=gcmd)
             else:
-                self.gcode.run_script_from_command("{} EXTRUDER={}".format(self.poop_cmd, cur_extruder.name))
+                self.run_script(f"{self.poop_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
 
 
             self.afcDeltaTime.log_with_time("TOOL_LOAD: After poop")
             self.function.log_toolhead_pos()
 
             if self.wipe:
-                self.gcode.run_script_from_command("{} EXTRUDER={}".format(self.wipe_cmd, cur_extruder.name))
+                self.run_script(f"{self.wipe_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
                 self.afcDeltaTime.log_with_time("TOOL_LOAD: After first wipe")
                 self.function.log_toolhead_pos()
 
         if self.kick:
-            self.gcode.run_script_from_command("{} EXTRUDER={}".format(self.kick_cmd, cur_extruder.name))
+            self.run_script(f"{self.kick_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
             self.afcDeltaTime.log_with_time("TOOL_LOAD: After kick")
             self.function.log_toolhead_pos()
 
         if self.wipe:
-            self.gcode.run_script_from_command("{} EXTRUDER={}".format(self.wipe_cmd, cur_extruder.name))
+            self.run_script(f"{self.wipe_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
             self.afcDeltaTime.log_with_time("TOOL_LOAD: After second wipe")
             self.function.log_toolhead_pos()
 
@@ -1624,19 +1689,21 @@ class afc:
 
         cur_lane = self.lanes[lane]
         if cur_lane.extruder_obj.lane_loaded == cur_lane.name:
-            self.error.AFC_error("Not loading {}, already loaded".format(lane), pause=self.function.in_print())
+            self.error.AFC_error("Not loading {}, already loaded".format(lane),
+                                 pause=self.function.in_print(), gcmd=gcmd)
             return
 
         purge_length = gcmd.get('PURGE_LENGTH', None)
 
-        if not self.TOOL_LOAD(cur_lane, purge_length):
+        if not self.TOOL_LOAD(cur_lane, purge_length, gcmd=gcmd):
             # Error happened, reset toolchanges without error count
             # and increase load error count
-            self.afc_stats.increase_load_error_count(self)
+            if self.afc_stats is not None:
+                self.afc_stats.increase_load_error_count(self)
 
     def TOOL_LOAD(self, cur_lane: AFCLane, purge_length: Optional[float]=None,
                   set_start_time: bool=False, load_to_gears: bool=False,
-                  restore_temp: bool=True) -> bool:
+                  restore_temp: bool=True, *, gcmd: AFCGcmd) -> bool:
         """
         This function handles the loading of a specified lane into the tool. It performs
         several checks and movements to ensure the lane is properly loaded.
@@ -1647,9 +1714,10 @@ class afc:
         :param load_to_gears: Stop after loading filament to the extruder gears or sensor.
         :param restore_temp: Set False to skip restoring the toolhead's temperature when
                              done, needed when the caller manages temperature itself.
+        :param gcmd: command context to run load macros through, if any
         :return bool: True if load was successful, False if an error occurred.
         """
-        if not self.function.check_homed():
+        if not self.function.check_homed(gcmd=gcmd):
             return False
 
         if set_start_time:
@@ -1659,25 +1727,25 @@ class afc:
         if error_str:
             self.error.AFC_error(
                 f"Error occurred when verifying macro positions, TOOL_LOAD aborted.\n{error_str}",
-                pause=self.function.in_print()
+                pause=self.function.in_print(), gcmd=gcmd
             )
             return False
 
         if cur_lane is None:
             self.error.AFC_error("No lane provided to load, not loading any lane.",
-                                 pause=self.function.in_print())
+                                 pause=self.function.in_print(), gcmd=gcmd)
             # Exit early if no lane is provided.
             return False
 
         # Check if the bypass filament sensor is triggered; abort loading if filament is already present.
-        if self._check_bypass(): return False
+        if self._check_bypass(gcmd=gcmd): return False
 
         # Verify that printer is in absolute mode
         self.function.check_absolute_mode("TOOL_LOAD")
 
         # If the current extruder is not the one associated with the lane, switch to it.
         if self.function.get_current_extruder() != cur_lane.extruder_obj.th_extruder_name:
-            cur_lane.tool_swap()
+            cur_lane.tool_swap(gcmd=gcmd)
 
         # After a tool swap the newly active extruder may already have a different lane
         # loaded (e.g. after a restart). Unload it before attempting to load the new lane.
@@ -1688,13 +1756,14 @@ class afc:
                 self.error.AFC_error(
                     'Extruder "{}" has lane {} that is not in configured lanes.'.format(
                         cur_extruder_obj.name, lane_name),
-                    pause=self.function.in_print())
+                    pause=self.function.in_print(), gcmd=gcmd)
                 return False
-            if not self.TOOL_UNLOAD(self.lanes[lane_name], set_start_time=False):
+            if not self.TOOL_UNLOAD(self.lanes[lane_name], set_start_time=False, gcmd=gcmd):
                 msg = ('Failed to unload currently loaded lane {} from extruder {} before loading new lane {}.'.format(
                     lane_name, cur_extruder_obj.name, cur_lane.name))
-                self.error.fix(msg, self.lanes[lane_name])
-                self.afc_stats.increase_unload_error_count(self)
+                self.error.fix(msg, self.lanes[lane_name], gcmd=gcmd)
+                if self.afc_stats is not None:
+                    self.afc_stats.increase_unload_error_count(self)
                 return False
 
         if cur_lane.name != self.current:
@@ -1714,17 +1783,17 @@ class afc:
                 # Set the lane status to 'loading' and activate the loading LED.
                 cur_lane.status = AFCLaneState.TOOL_LOADING
                 self.save_vars()
-                cur_lane.unit_obj.lane_loading( cur_lane )
+                cur_lane.unit_obj.lane_loading( cur_lane, gcmd=gcmd )
 
                 temp_state = self.capture_toolhead_temp()
                 try:
                     # Run the load sequence, which may include custom gcode commands.
-                    self._set_display_status('pushing', True)
+                    self._set_display_status('pushing', True, gcmd=gcmd)
                     try:
                         success = self.load_sequence(cur_lane, cur_hub, cur_extruder,
-                                                     load_to_gears)
+                                                     load_to_gears, gcmd=gcmd)
                     finally:
-                        self._set_display_status('pushing', False)
+                        self._set_display_status('pushing', False, gcmd=gcmd)
                     if not success:
                         # A failure that didn't pause (outside a print) would
                         # otherwise leave AFC stuck in LOADING.
@@ -1733,32 +1802,36 @@ class afc:
                         return success
 
                     # Activate the tool-loaded LED and handle filament operations if enabled.
-                    cur_lane.unit_obj.lane_tool_loaded( cur_lane )
+                    cur_lane.unit_obj.lane_tool_loaded( cur_lane, gcmd=gcmd )
                     if not load_to_gears:
                         cur_lane.espooler.do_assist_move()
                         self.do_poop_kick_wipe(cur_lane=cur_lane, cur_extruder=cur_extruder,
-                                               purge_length=purge_length)
+                                               purge_length=purge_length, gcmd=gcmd)
 
                     cur_lane.enable_fault_detection()
                     # Update lane and extruder state for tracking.
                     cur_extruder.lane_loaded = cur_lane.name
                     self.spool.set_active_spool(cur_lane.spool_id)
-                    cur_lane.unit_obj.lane_tool_loaded( cur_lane )
+                    cur_lane.unit_obj.lane_tool_loaded( cur_lane, gcmd=gcmd )
                     self.save_vars()
                     self.current_state = State.IDLE
                     if not load_to_gears:
                         cur_lane.get_td1_data_load()
                         load_time = self.afcDeltaTime.log_major_delta(
                             f"{cur_lane.name} is now loaded in toolhead", False)
-                        self.afc_stats.average_tool_load_time.average_time(load_time)
+                        if self.afc_stats is not None:
+                            self.afc_stats.average_tool_load_time.average_time(load_time)
 
-                        # Increment stat counts
-                        cur_lane.extruder_obj.estats.tc_tool_load.increase_count()
-                        cur_lane.lane_load_count.increase_count()
+                        # Increment stat counts. estats fields and lane_load_count are only
+                        # assigned once moonraker connects, so stay unset if it never does.
+                        if cur_lane.extruder_obj.estats._stats_ready:
+                            cur_lane.extruder_obj.estats.tc_tool_load.increase_count()
+                        if cur_lane.lane_load_count is not None:
+                            cur_lane.lane_load_count.increase_count()
                         cur_lane.espooler.stats.update_database()
 
                         if self.post_load_macro is not None:
-                            self.gcode.run_script_from_command(self.post_load_macro)
+                            self.run_script(self.post_load_macro, gcmd=gcmd)
                             # TODO: Add afcDeltaTime log
                 finally:
                     if restore_temp:
@@ -1771,7 +1844,8 @@ class afc:
                     if self.function.in_print():
                         message += f'\nOnce issue is resolved please manually load {cur_lane.name} '
                         message += f'with {cur_lane.current_map} macro and click resume to continue printing.'
-                    self.error.handle_lane_failure(cur_lane, message, pause=self.function.in_print())
+                    self.error.handle_lane_failure(cur_lane, message,
+                                                   pause=self.function.in_print(), gcmd=gcmd)
                     return False
                 if not cur_lane.load_state:
                     message = 'Current lane not loaded, LOAD TRIGGER NOT TRIGGERED\n||==>--||----||-----||\nTRG   LOAD   HUB   TOOL'
@@ -1779,7 +1853,8 @@ class afc:
                     if self.function.in_print():
                         message += f'\nOnce issue is resolved please manually load {cur_lane.name} '
                         message += f'with {cur_lane.current_map} macro and click resume to continue printing.'
-                    self.error.handle_lane_failure(cur_lane, message, pause=self.function.in_print())
+                    self.error.handle_lane_failure(cur_lane, message,
+                                                   pause=self.function.in_print(), gcmd=gcmd)
                     return False
 
         # Check if toolhead needs to purge, this normally should only apply for standalone toolheads
@@ -1792,16 +1867,16 @@ class afc:
                 if self._check_extruder_temp(cur_lane):
                     self.afcDeltaTime.log_with_time("Done heating toolhead")
                 self.do_poop_kick_wipe(cur_lane=cur_lane, cur_extruder=cur_lane.extruder_obj,
-                                    purge_length=purge_length)
+                                    purge_length=purge_length, gcmd=gcmd)
 
                 if self.post_load_macro is not None:
-                    self.gcode.run_script_from_command(self.post_load_macro)
+                    self.run_script(self.post_load_macro, gcmd=gcmd)
                     # TODO: Add afcDeltaTime log
             except Exception as e:
                 self.error.AFC_error(
                     (f"Error occurred when trying to purge {cur_lane.extruder_obj.name}."
                      " See AFC.log for error trace."),
-                    pause=self.function.in_print()
+                    pause=self.function.in_print(), gcmd=gcmd
                 )
                 self.logger.debug(f"Exception: {e}\n{traceback.format_exc()}")
                 return False
@@ -1812,7 +1887,8 @@ class afc:
         return True
 
     def load_sequence(self, cur_lane: AFCLane, cur_hub: afc_hub,
-                      cur_extruder: AFCExtruder, load_to_gears: bool=False) -> bool:
+                      cur_extruder: AFCExtruder, load_to_gears: bool=False, *,
+                      gcmd: AFCGcmd) -> bool:
         """
         This function controls the loading sequence and allows for custom gcode commands to be executed
         during the loading process.
@@ -1821,11 +1897,12 @@ class afc:
         :param cur_hub: The hub object associated with the lane.
         :param cur_extruder: The extruder object associated with the lane.
         :param load_to_gears: Stop after loading filament to the extruder gears or sensor.
+        :param gcmd: command context to run load macros through, if any
         :return bool: True when loading succeeds, otherwise False
         """
         if (self.park_pre_load
             and self.park_pre_load_cmd):
-            self.gcode.run_script_from_command(self.park_pre_load_cmd)
+            self.run_script(self.park_pre_load_cmd, gcmd=gcmd)
 
         # Prepare the extruder and hotend for loading.
         if self._check_extruder_temp(cur_lane):
@@ -1835,7 +1912,7 @@ class afc:
         if cur_lane.custom_load_cmd:
             self.logger.info("Running custom load command for lane {}".format(cur_lane.name))
 
-            self.gcode.run_script_from_command(cur_lane.custom_load_cmd)
+            self.run_script(cur_lane.custom_load_cmd, gcmd=gcmd)
             if cur_lane.get_toolhead_pre_sensor_state():
                 cur_lane.status = AFCLaneState.TOOL_LOADED
                 self.save_vars()
@@ -1846,10 +1923,10 @@ class afc:
                 message += '\nthen load into extruder gears with extrude button in your gui of choice until the color fully changes'
                 if self.function.in_print():
                     message += '\nOnce filament is fully loaded click resume to continue printing'
-                self.error.handle_lane_failure(cur_lane, message)
+                self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                 return False
         elif hasattr(cur_lane.unit_obj, "unit_load_lane"):
-            if not cur_lane.unit_obj.unit_load_lane(cur_lane, cur_extruder):
+            if not cur_lane.unit_obj.unit_load_lane(cur_lane, cur_extruder, gcmd=gcmd):
                 return False
         else:
             use_direct_dist = False
@@ -1869,17 +1946,17 @@ class afc:
                     home_endstop= cur_lane.get_toolhead_endstop()
                     _, _, warn = cur_lane.unit_obj.load_then_home(cur_lane, dist_to_hub,
                                                                   AssistActive.DYNAMIC,
-                                                                  home_endstop)
+                                                                  home_endstop, gcmd=gcmd)
                 else:
                     _, _, warn = cur_lane.unit_obj.move_to_hub(cur_lane, dist_to_hub,
                                                                MoveDirection.POS,
                                                                self.homing_enabled,
-                                                               speed_mode=SpeedMode.LONG)
+                                                               speed_mode=SpeedMode.LONG, gcmd=gcmd)
                 # Check for error and return, if error state is set then AFC tried pausing
                 # during the homing
                 if warn == AFCMoveWarning.ERROR:
                     self.error.AFC_error("Homing error occurred when trying to move to"\
-                                         f" hub sensor for {cur_lane.name}", pause=False)
+                                         f" hub sensor for {cur_lane.name}", pause=False, gcmd=gcmd)
                     return False
                 self.afcDeltaTime.log_with_time(
                     f"Loaded to {'hub' if not cur_lane.is_direct_hub() else 'toolhead'}"
@@ -1892,12 +1969,12 @@ class afc:
             while not cur_hub.state and not cur_lane.is_direct_hub():
                 _, _, warn = cur_lane.unit_obj.move_to_hub(cur_lane, cur_hub.move_dis,
                                                            MoveDirection.POS,
-                                                           self.homing_enabled)
+                                                           self.homing_enabled, gcmd=gcmd)
                 # Check for error and return, if error state is set then AFC tried pausing
                 # during the homing
                 if warn == AFCMoveWarning.ERROR:
                     self.error.AFC_error("Homing error occurred when trying to short move to"\
-                                         f" hub sensor for {cur_lane.name}", pause=False)
+                                         f" hub sensor for {cur_lane.name}", pause=False, gcmd=gcmd)
                     return False
                 hub_attempts += 1
                 if hub_attempts > 20:
@@ -1907,7 +1984,7 @@ class afc:
                         message += f'with {cur_lane.current_map} macro and click resume to continue '
                         message += 'printing. \nIf you have to retract filament back, use '
                         message += f'LANE_MOVE macro for {cur_lane.name}.'
-                    self.error.handle_lane_failure(cur_lane, message)
+                    self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                     return False
 
             self.afcDeltaTime.log_with_time("Filament loaded to hub")
@@ -1918,12 +1995,13 @@ class afc:
                 _, _, warn = cur_lane.unit_obj.load_then_home(cur_lane,
                                                               distance,
                                                               AssistActive.DYNAMIC,
-                                                              cur_lane.get_toolhead_endstop())
+                                                              cur_lane.get_toolhead_endstop(),
+                                                              gcmd=gcmd)
                 # Check for error and return, if error state is set then AFC tried pausing
                 # during the homing
                 if warn == AFCMoveWarning.ERROR:
                     self.error.AFC_error("Homing error occurred when trying to move to"\
-                                         f" toolhead for {cur_lane.name}", pause=False)
+                                         f" toolhead for {cur_lane.name}", pause=False, gcmd=gcmd)
                     return False
             # Ensure filament reaches the toolhead.
             tool_attempts = 0
@@ -1942,16 +2020,18 @@ class afc:
                         self.logger.info("Distance stopped short of commanded distance to toolhead, "\
                                         "backing up and retrying load.")
                         _, _, warn = cur_lane.move_to(100 * MoveDirection.NEG, SpeedMode.SHORT,
-                                        use_homing=False)
+                                        use_homing=False, gcmd=gcmd)
 
                     _, dist, warn = cur_lane.move_to(move_distance, SpeedMode.SHORT,
                                                     endstop=cur_lane.get_toolhead_endstop(),
-                                                    use_homing=self.homing_enabled and self.home_to_tool)
+                                                    use_homing=self.homing_enabled and self.home_to_tool,
+                                                    gcmd=gcmd)
                     # Check for error and return, if error state is set then AFC tried pausing
                     # during the homing
                     if warn == AFCMoveWarning.ERROR:
                         self.error.AFC_error("Homing error occurred when trying to slow move to"\
-                                             f" toolhead for {cur_lane.name}", pause=False)
+                                             f" toolhead for {cur_lane.name}",
+                                             pause=False, gcmd=gcmd)
                         return False
                     if (dist > 50.0
                         and self.homing_enabled):
@@ -1967,7 +2047,7 @@ class afc:
                             message += f"back to hub. Once lane is reset try reload lane with {cur_lane.current_map} macro."
                         if self.function.in_print():
                             message += '\nOnce filament is fully loaded click resume to continue printing'
-                        self.error.handle_lane_failure(cur_lane, message)
+                        self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                         return False
 
             self.afcDeltaTime.log_with_time("Filament loaded to pre-sensor")
@@ -1975,11 +2055,11 @@ class afc:
             # Synchronize lane's extruder stepper and finalize tool loading.
             cur_lane.status = AFCLaneState.TOOL_LOADED
             self.save_vars()
-            cur_lane.sync_to_extruder()
-            cur_lane.unit_obj.lane_tool_loaded_gears(cur_lane)
+            cur_lane.sync_to_extruder(gcmd=gcmd)
+            cur_lane.unit_obj.lane_tool_loaded_gears(cur_lane, gcmd=gcmd)
 
             if load_to_gears:
-                cur_lane.set_tool_loaded(normal_toolchange=True)
+                cur_lane.set_tool_loaded(normal_toolchange=True, gcmd=gcmd)
                 cur_lane.enable_buffer(disable_fault=True)
                 self.save_vars()
                 return True
@@ -1995,7 +2075,7 @@ class afc:
                         message += '\nAlso might be a good idea to verify that post extruder gear toolhead sensor is working.'
                         if self.function.in_print():
                             message += '\nOnce issue is resolved click resume to continue printing'
-                        self.error.handle_lane_failure(cur_lane, message)
+                        self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                         return False
 
                 self.afcDeltaTime.log_with_time("Filament loaded to post-sensor")
@@ -2009,10 +2089,10 @@ class afc:
             # Lane will load until Advance sensor is True
             # After the tool_stn distance the lane will retract off the sensor to confirm load and reset buffer
             if cur_extruder.tool_start == "buffer":
-                cur_lane.unsync_to_extruder()
+                cur_lane.unsync_to_extruder(gcmd=gcmd)
                 load_checks = 0
                 while cur_lane.get_toolhead_pre_sensor_state():
-                    cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT)
+                    cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT, gcmd=gcmd)
                     load_checks += 1
                     self.reactor.pause(self.reactor.monotonic() + 0.1)
                     if load_checks > self.tool_max_load_checks:
@@ -2024,12 +2104,12 @@ class afc:
                         msg += "manually extrude filament and clean nozzle."
                         if self.function.in_print():
                             msg += '\nOnce issue is resolved click resume to continue printing'
-                        self.error.handle_lane_failure(cur_lane, msg)
+                        self.error.handle_lane_failure(cur_lane, msg, gcmd=gcmd)
                         return False
-                cur_lane.sync_to_extruder()
+                cur_lane.sync_to_extruder(gcmd=gcmd)
 
         # Update tool and lane status.
-        cur_lane.set_tool_loaded(normal_toolchange=True)
+        cur_lane.set_tool_loaded(normal_toolchange=True, gcmd=gcmd)
         # Setting disable_fault so that fault detection is turned off for users
         # that utilize poop
         cur_lane.enable_buffer(disable_fault=True)
@@ -2058,7 +2138,7 @@ class afc:
         # How would you deal with multiple extruders....
 
         # Check if the bypass filament sensor detects filament; if so unload filament and abort the tool load.
-        if self._check_bypass(unload=True): return False
+        if self._check_bypass(unload=True, gcmd=gcmd): return False
 
         lane = gcmd.get('LANE', self.current)
         if lane is None:
@@ -2067,16 +2147,17 @@ class afc:
             self.logger.info('{} Unknown'.format(lane))
             return
         cur_lane = self.lanes[lane]
-        if not self.TOOL_UNLOAD(cur_lane):
+        if not self.TOOL_UNLOAD(cur_lane, gcmd=gcmd):
             # Error happened, reset toolchanges without error count
             # and increase unload error count
-            self.afc_stats.increase_unload_error_count(self)
+            if self.afc_stats is not None:
+                self.afc_stats.increase_unload_error_count(self)
 
         # User manually unloaded spool from toolhead, remove spool from active status
         self.spool.set_active_spool(None)
 
     def TOOL_UNLOAD(self, cur_lane: AFCLane, set_start_time: bool=True, force_unload: bool=False,
-                    restore_temp: bool=True) -> bool:
+                    restore_temp: bool=True, *, gcmd: AFCGcmd) -> bool:
         """
         This function handles the unloading of a specified lane from the tool. It performs
         several checks and movements to ensure the lane is properly unloaded.
@@ -2088,29 +2169,30 @@ class afc:
                              toolhead.
         :param restore_temp: Set False to skip restoring the toolhead's temperature when
                              done, needed when the caller manages temperature itself.
+        :param gcmd: command context to run unload macros through, if any
         :return bool: True if unloading was successful, False if an error occurred.
         """
         # Check if the bypass filament sensor detects filament; if so unload filament and abort the tool load.
-        if self._check_bypass(unload=True): return False
+        if self._check_bypass(unload=True, gcmd=gcmd): return False
 
         if set_start_time:
             self.afcDeltaTime.set_start_time()
 
-        if not self.function.check_homed():
+        if not self.function.check_homed(gcmd=gcmd):
             return False
 
         error_str = self.verify_macro_positions()
         if error_str:
             self.error.AFC_error(
                 f"Error occurred when verifying macro positions, TOOL_UNLOAD aborted.\n{error_str}",
-                pause=self.function.in_print()
+                pause=self.function.in_print(), gcmd=gcmd
             )
             return False
 
         if cur_lane is None:
             # If no lane is provided, exit the function early with a failure.
             self.error.AFC_error("No lane is currently loaded, nothing to unload",
-                                 pause=self.function.in_print())
+                                 pause=self.function.in_print(), gcmd=gcmd)
             return False
 
         # Lookup current extruder object using the lane's information.
@@ -2136,7 +2218,7 @@ class afc:
             next_lane       = self.lanes.get(next_lookup_lane_name)
             if next_lane is None:
                 self.error.AFC_error(f"Lane '{next_lookup_lane_name}' not found in AFC lane mapping during unload operation.",
-                                    pause=self.function.in_print())
+                                    pause=self.function.in_print(), gcmd=gcmd)
                 return False
 
             next_extruder   = next_lane.extruder_obj.th_extruder_name
@@ -2145,7 +2227,7 @@ class afc:
             # If the next extruder is specified and it is not the current extruder, perform a tool swap.
             if (next_extruder is not None
                 and self.function.get_current_extruder() != next_extruder):
-                next_lane.tool_swap()
+                next_lane.tool_swap(gcmd=gcmd)
 
                 # Lookup the current extruder and lane objects based on the next lane to load.
                 # This is necessary to ensure the correct extruder and lane are used for unloading.
@@ -2167,7 +2249,9 @@ class afc:
 
             self.logger.debug(f"Next lane load:{self.next_lane_load}, lanes:{cur_extruder.lanes}, current lane:{cur_lane}, unload_toolhead:{unload_toolhead}")
 
-        if self.current is not None and unload_toolhead:
+        if (self.current is not None
+            and unload_toolhead
+            and cur_lane is not None):
             self.current_state  = State.UNLOADING
             self.current_loading = cur_lane.name
             self.logger.info("Unloading {}".format(cur_lane.name))
@@ -2180,11 +2264,11 @@ class afc:
             temp_state = self.capture_toolhead_temp()
             try:
                 # Run the unload sequence, which may include custom gcode commands.
-                self._set_display_status('retraction', True)
+                self._set_display_status('retraction', True, gcmd=gcmd)
                 try:
-                    success = self.unload_sequence(cur_lane, cur_hub, cur_extruder)
+                    success = self.unload_sequence(cur_lane, cur_hub, cur_extruder, gcmd=gcmd)
                 finally:
-                    self._set_display_status('retraction', False)
+                    self._set_display_status('retraction', False, gcmd=gcmd)
                     cur_lane.unit_obj.finish_unload(cur_lane)
                 if not success:
                     # A failure that didn't pause (outside a print) would
@@ -2196,41 +2280,38 @@ class afc:
                 if restore_temp: self.restore_toolhead_temp(temp_state)
 
             unload_time = self.afcDeltaTime.log_major_delta("Lane {} unload done".format(cur_lane.name if cur_lane is not None else "None"))
-            self.afc_stats.average_tool_unload_time.average_time(unload_time)
+            if self.afc_stats is not None:
+                self.afc_stats.average_tool_unload_time.average_time(unload_time)
             if cur_lane is not None and cur_lane.hub == 'direct_load':
-                self.LANE_UNLOAD(cur_lane)
+                self.LANE_UNLOAD(cur_lane, gcmd=gcmd)
         self.current_state = State.IDLE
         return True
 
-    def do_tool_cut_tip_form(self, cur_lane: AFCLane, cur_extruder: AFCExtruder) -> None:
+    def do_tool_cut_tip_form(self, cur_lane: AFCLane, cur_extruder: AFCExtruder,
+                             gcmd: AFCGcmd) -> None:
         """
         Performs filament cutting/parking and tip forming during unload, if enabled in config.
 
         :param cur_lane: The lane object being unloaded.
         :param cur_extruder: The extruder object associated with the lane.
+        :param gcmd: command context to run the cut/park/tip macros through, if any
         """
         # Perform filament cutting and parking if specified.
         if self.tool_cut:
             cur_lane.extruder_obj.estats.increase_cut_total()
-            self.gcode.run_script_from_command(
-                "{} EXTRUDER={}".format(self.tool_cut_cmd, cur_extruder.name)
-            )
+            self.run_script(f"{self.tool_cut_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
             self.afcDeltaTime.log_with_time("TOOL_UNLOAD: After cut")
             self.function.log_toolhead_pos()
 
             if self.park:
-                self.gcode.run_script_from_command(
-                    "{} EXTRUDER={}".format(self.park_cmd, cur_extruder.name)
-                )
+                self.run_script(f"{self.park_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
                 self.afcDeltaTime.log_with_time("TOOL_UNLOAD: After park")
                 self.function.log_toolhead_pos()
 
         # Form filament tip if necessary.
         if self.form_tip:
             if self.park:
-                self.gcode.run_script_from_command(
-                    "{} EXTRUDER={}".format(self.park_cmd, cur_extruder.name)
-                )
+                self.run_script(f"{self.park_cmd} EXTRUDER={cur_extruder.name}", gcmd=gcmd)
                 self.afcDeltaTime.log_with_time("TOOL_UNLOAD: After form tip park")
                 self.function.log_toolhead_pos()
 
@@ -2241,11 +2322,12 @@ class afc:
                 self.function.log_toolhead_pos()
 
             else:
-                self.gcode.run_script_from_command(self.form_tip_cmd)
+                self.run_script(self.form_tip_cmd, gcmd=gcmd)
                 self.afcDeltaTime.log_with_time("TOOL_UNLOAD: After custom form tip")
                 self.function.log_toolhead_pos()
 
-    def unload_sequence(self, cur_lane: AFCLane, cur_hub: afc_hub, cur_extruder: AFCExtruder):
+    def unload_sequence(self, cur_lane: AFCLane, cur_hub: afc_hub, cur_extruder: AFCExtruder,
+                        gcmd: AFCGcmd):
         """
         This function controls the unloading sequence and allows for custom gcode commands to be executed
         during the loading process.
@@ -2253,10 +2335,11 @@ class afc:
         :param cur_lane: The lane object to be loaded.
         :param cur_hub: The hub object associated with the lane.
         :param cur_extruder: The extruder object associated with the lane.
+        :param gcmd: command context to run unload macros through, if any
         """
 
         # Activate LED indicator for unloading.
-        cur_lane.unit_obj.lane_unloading(cur_lane)
+        cur_lane.unit_obj.lane_unloading(cur_lane, gcmd=gcmd)
 
         # Prepare the extruder and hotend for unloading.
         if self._check_extruder_temp(cur_lane):
@@ -2266,17 +2349,17 @@ class afc:
             self.logger.info("Running custom unload command for lane {}".format(cur_lane.name))
 
             cur_lane.status = AFCLaneState.TOOL_UNLOADING
-            self.gcode.run_script_from_command(cur_lane.custom_unload_cmd)
+            self.run_script(cur_lane.custom_unload_cmd, gcmd=gcmd)
 
             if self.post_unload_macro is not None:
-                self.gcode.run_script_from_command(self.post_unload_macro)
+                self.run_script(self.post_unload_macro, gcmd=gcmd)
                 # TODO: Add afcDeltaTime log
 
-            cur_lane.set_tool_unloaded(normal_toolchange=True)
+            cur_lane.set_tool_unloaded(normal_toolchange=True, gcmd=gcmd)
             cur_lane.status = AFCLaneState.NONE
             self.save_vars()
         elif hasattr(cur_lane.unit_obj, "unit_unload_lane"):
-            if not cur_lane.unit_obj.unit_unload_lane(cur_lane, cur_extruder):
+            if not cur_lane.unit_obj.unit_unload_lane(cur_lane, cur_extruder, gcmd=gcmd):
                 return False
         else:
             use_direct_dist = False
@@ -2292,24 +2375,24 @@ class afc:
             cur_lane.disable_buffer()
 
             # Synchronize the extruder stepper with the lane.
-            cur_lane.sync_to_extruder()
+            cur_lane.sync_to_extruder(gcmd=gcmd)
 
-            cur_lane.select_lane()
+            cur_lane.select_lane(gcmd=gcmd)
 
-            self.do_tool_cut_tip_form(cur_lane, cur_extruder)
+            self.do_tool_cut_tip_form(cur_lane, cur_extruder, gcmd=gcmd)
 
             # Attempt to unload the filament from the extruder, retrying if needed.
             num_tries = 0
             if cur_extruder.tool_start == "buffer":
                 # if ramming is enabled, AFC will retract to collapse buffer before unloading
-                cur_lane.unsync_to_extruder()
+                cur_lane.unsync_to_extruder(gcmd=gcmd)
                 while not cur_lane.get_trailing() and cur_lane.tool_max_unload_attempts > 0:
                     num_tries += 1
                     self.afcDeltaTime.log_with_time(
                         f'TOOL_UNLOAD: Retracting Buffer, Try:{num_tries}'
                     )
                     # attempt to return buffer to trailing pin
-                    cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT)
+                    cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT, gcmd=gcmd)
                     self.reactor.pause(self.reactor.monotonic() + 0.5)
                     if num_tries > cur_lane.tool_max_unload_attempts:
                         msg = ''
@@ -2324,9 +2407,9 @@ class afc:
                             msg += f"with {self.lanes[self.next_lane_load].current_map} macro.\n"
                             if self.function.in_print():
                                 msg += "Once lane is loaded click resume to continue printing"
-                        self.error.handle_lane_failure(cur_lane, msg)
+                        self.error.handle_lane_failure(cur_lane, msg, gcmd=gcmd)
                         return False
-                cur_lane.sync_to_extruder(False)
+                cur_lane.sync_to_extruder(False, gcmd=gcmd)
                 # we only need to do this if we need to move off the extruder gears
                 if cur_extruder.tool_stn_unload > 0:
                     self.afcDeltaTime.log_with_time(
@@ -2339,14 +2422,15 @@ class afc:
             else:
 
                 if cur_extruder.tool_stn_unload == 0:
-                    cur_lane.unsync_to_extruder()
+                    cur_lane.unsync_to_extruder(gcmd=gcmd)
                     while cur_lane.get_toolhead_pre_sensor_state():
                         num_tries += 1
                         self.afcDeltaTime.log_with_time(
                             f'TOOL_UNLOAD: Sensor-Unloading from toolhead(tool_stn_unload==0), Try:{num_tries}'
                         )
                         # attempt to move filament back from sensor without moving extruder
-                        cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT)
+                        cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT,
+                                               gcmd=gcmd)
                         if num_tries > cur_lane.tool_max_unload_attempts:
                             # note that this will break out of the loop and immediately fall into the error
                             # condition of the next loop for messaging to the user
@@ -2368,13 +2452,13 @@ class afc:
                                 message += f"\nThen manually load {self.next_lane_load} with {map_str} macro"
                                 if self.function.in_print():
                                     message += "\nOnce lane is loaded click resume to continue printing"
-                        self.error.handle_lane_failure(cur_lane, message)
+                        self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                         return False
 
                     self.afcDeltaTime.log_with_time(
                         f'TOOL_UNLOAD: Sensor-Unloading from toolhead(tool_stn_unload), Try:{num_tries}'
                     )
-                    cur_lane.sync_to_extruder()
+                    cur_lane.sync_to_extruder(gcmd=gcmd)
 
                     with cur_lane.assist_move(cur_extruder.tool_unload_speed, True, cur_lane.assisted_unload):
                         self.move_e_pos( cur_extruder.tool_stn_unload * -1, cur_extruder.tool_unload_speed, "Sensor move", wait_tool=True)
@@ -2394,34 +2478,34 @@ class afc:
 
             self.save_vars()
             # Synchronize and move filament out of the hub.
-            cur_lane.unsync_to_extruder()
+            cur_lane.unsync_to_extruder(gcmd=gcmd)
             if not cur_lane.is_direct_hub():
                 distance = cur_lane.dist_hub if use_direct_dist else cur_hub.afc_unload_bowden_length
                 _, _, warn = cur_lane.unit_obj.move_to_hub(cur_lane, distance,
                                                            MoveDirection.NEG, self.homing_enabled,
-                                                           speed_mode=SpeedMode.LONG)
+                                                           speed_mode=SpeedMode.LONG, gcmd=gcmd)
                 # Check for error and return, if error state is set then AFC tried pausing
                 # during the homing
                 if warn == AFCMoveWarning.ERROR:
                     self.error.AFC_error("Homing error occurred when trying to move back to"\
-                                         f" hub sensor for {cur_lane.name}")
+                                         f" hub sensor for {cur_lane.name}", gcmd=gcmd)
                     return False
             else:
                 _, _, warn = cur_lane.move_to(cur_lane.dist_hub * -1, SpeedMode.LONG,
                                               assist_active = AssistActive.DYNAMIC,
                                               endstop=cur_lane.load_es,
-                                              use_homing=self.homing_enabled)
+                                              use_homing=self.homing_enabled, gcmd=gcmd)
                 # Check for error and return, if error state is set then AFC tried pausing
                 # during the homing
                 if warn == AFCMoveWarning.ERROR:
                     self.error.AFC_error("Homing error occurred when trying to move back to"\
-                                         f" load sensor for {cur_lane.name}")
+                                         f" load sensor for {cur_lane.name}", gcmd=gcmd)
                     return False
 
             self.afcDeltaTime.log_with_time("Long retract done")
 
             # Clear toolhead's loaded state for easier error handling later.
-            cur_lane.set_tool_unloaded(normal_toolchange=True)
+            cur_lane.set_tool_unloaded(normal_toolchange=True, gcmd=gcmd)
             self.save_vars()
 
             # Ensure filament is fully cleared from the hub.
@@ -2433,12 +2517,13 @@ class afc:
                     max_attempts = 2
                     move_dist = cur_hub.afc_unload_bowden_length
                 _, _, warn = cur_lane.unit_obj.move_to_hub(cur_lane, move_dist,
-                                                           MoveDirection.NEG, self.homing_enabled)
+                                                           MoveDirection.NEG, self.homing_enabled,
+                                                           gcmd=gcmd)
                 # Check for error and return, if error state is set then AFC tried pausing
                 # during the homing
                 if warn == AFCMoveWarning.ERROR:
                     self.error.AFC_error("Homing error occurred when trying to move back to"\
-                                         f" hub sensor for {cur_lane.name}", pause=False)
+                                         f" hub sensor for {cur_lane.name}", pause=False, gcmd=gcmd)
                     return False
                 num_tries += 1
                 if num_tries >= max_attempts:
@@ -2454,7 +2539,7 @@ class afc:
                             if self.function.in_print():
                                 message += "\nOnce lane is loaded click resume to continue printing"
 
-                    self.error.handle_lane_failure(cur_lane, message)
+                    self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                     return False
 
             self.afcDeltaTime.log_with_time("Hub cleared")
@@ -2462,31 +2547,31 @@ class afc:
             #Move to make sure hub path is clear based on the move_clear_dis var
             if not cur_lane.is_direct_hub():
                 cur_lane.move_advanced(cur_hub.hub_clear_move_dis * -1, SpeedMode.SHORT,
-                                       assist_active=AssistActive.YES)
+                                       assist_active=AssistActive.YES, gcmd=gcmd)
 
                 # Cut filament at the hub, if configured.
                 if cur_hub.cut:
                     if cur_hub.cut_cmd == 'AFC':
-                        cur_hub.hub_cut(cur_lane)
+                        cur_hub.hub_cut(cur_lane, gcmd=gcmd)
                     else:
-                        self.gcode.run_script_from_command(cur_hub.cut_cmd)
+                        self.run_script(cur_hub.cut_cmd, gcmd=gcmd)
 
                     # Confirm the hub is clear after the cut.
                     while cur_hub.state:
                         cur_lane.move_advanced(cur_lane.short_move_dis * -1, SpeedMode.SHORT,
-                                               assist_active=AssistActive.YES)
+                                               assist_active=AssistActive.YES, gcmd=gcmd)
                         num_tries += 1
                         # TODO: Figure out max number of tries
                         if num_tries > (cur_hub.afc_unload_bowden_length / cur_lane.short_move_dis):
                             message = 'HUB NOT CLEARING after hub cut\n'
-                            self.error.handle_lane_failure(cur_lane, message)
+                            self.error.handle_lane_failure(cur_lane, message, gcmd=gcmd)
                             return False
 
                     self.afcDeltaTime.log_with_time("Hub cut done")
 
             # Finalize unloading and reset lane state.
             cur_lane.loaded_to_hub = True
-            cur_lane.unit_obj.lane_loaded(cur_lane)
+            cur_lane.unit_obj.lane_loaded(cur_lane, gcmd=gcmd)
             cur_lane.status = AFCLaneState.NONE
 
             if (cur_lane.is_direct_hub()
@@ -2494,16 +2579,16 @@ class afc:
                 park_tries = 0
                 while not cur_lane.raw_load_state and cur_lane.prep_state:
                     park_tries += 1
-                    cur_lane.move_advanced(cur_lane.short_move_dis, SpeedMode.SHORT)
+                    cur_lane.move_advanced(cur_lane.short_move_dis, SpeedMode.SHORT, gcmd=gcmd)
                     if park_tries >= 5:
                         break
 
             if self.post_unload_macro is not None:
-                self.gcode.run_script_from_command(self.post_unload_macro)
+                self.run_script(self.post_unload_macro, gcmd=gcmd)
                 # TODO: Add afcDeltaTime log
 
             cur_lane.do_enable(False)
-            cur_lane.unit_obj.return_to_home()
+            cur_lane.unit_obj.return_to_home(gcmd=gcmd)
 
             cur_lane.espooler.stats.update_database()
 
@@ -2512,7 +2597,9 @@ class afc:
         # Update tool and lane status.
         cur_lane.disable_buffer()
         cur_lane.do_enable(False)
-        cur_lane.extruder_obj.estats.tc_tool_unload.increase_count()
+        # estats fields are only assigned once moonraker connects, stay unset if it never does.
+        if cur_lane.extruder_obj.estats._stats_ready:
+            cur_lane.extruder_obj.estats.tc_tool_unload.increase_count()
         self.save_vars()
         return True
 
@@ -2551,13 +2638,13 @@ class afc:
             if renamed in self.gcode.ready_gcode_handlers:
                 sm_command = f"{renamed} A={a_param}"
                 self.logger.info(f"Calling snapmakers T(n) command: {sm_command}")
-                self.gcode.run_script_from_command(sm_command)
+                self.run_script(sm_command, gcmd=gcmd)
                 return
 
         # Check if the bypass filament sensor detects filament; if so, abort the tool change.
-        if self._check_bypass(unload=False): return
+        if self._check_bypass(unload=False, gcmd=gcmd): return
 
-        if not self.function.check_homed():
+        if not self.function.check_homed(gcmd=gcmd):
             return False
 
         purge_length = gcmd.get('PURGE_LENGTH', None)
@@ -2569,7 +2656,7 @@ class afc:
             try:
                 purge_length = float(purge_length.lstrip('='))
             except ValueError:
-                self.error.AFC_error("PURGE_LENGTH must be a numeric value", pause=False)
+                self.error.AFC_error("PURGE_LENGTH must be a numeric value", pause=False, gcmd=gcmd)
                 return
 
         new_extruder_temp = gcmd.get('NEW_EXTRUDER_TEMP', None)
@@ -2577,7 +2664,8 @@ class afc:
             try:
                 new_extruder_temp = float(new_extruder_temp.lstrip('='))
             except ValueError:
-                self.error.AFC_error("NEW_EXTRUDER_TEMP must be a numeric value", pause=False)
+                self.error.AFC_error("NEW_EXTRUDER_TEMP must be a numeric value",
+                                     pause=False, gcmd=gcmd)
                 return
 
         command_line = gcmd.get_commandline()
@@ -2600,22 +2688,37 @@ class afc:
             Tcmd = command
 
         if Tcmd == '':
-            self.error.AFC_error("I did not understand the change -- " + cmd, pause=self.function.in_print())
+            self.error.AFC_error("I did not understand the change -- " + cmd,
+                                 pause=self.function.in_print(), gcmd=gcmd)
             return
 
         change_to_lane_name: str = self.tool_cmds.get(Tcmd, "")
         change_to_lane = self.lanes.get(change_to_lane_name, None)
         if change_to_lane:
             change_to_lane.current_map = Tcmd
-            self.CHANGE_TOOL(change_to_lane, purge_length, new_extruder_temp=new_extruder_temp)
+            self.CHANGE_TOOL(change_to_lane, purge_length, new_extruder_temp=new_extruder_temp,
+                             gcmd=gcmd)
         else:
-            self.error.AFC_error(f"Error trying to lookup lane for {Tcmd}")
+            self.error.AFC_error(f"Error trying to lookup lane for {Tcmd}", gcmd=gcmd)
 
-    def CHANGE_TOOL(self, cur_lane: AFCLane, purge_length: Optional[float]=None, restore_pos: bool=True, new_extruder_temp: Optional[float]=None) -> None:
+    def CHANGE_TOOL(self, cur_lane: AFCLane, purge_length: Optional[float]=None,
+                    restore_pos: bool=True, new_extruder_temp: Optional[float]=None, *,
+                    gcmd: AFCGcmd) -> None:
+        """
+        Perform a tool change: unload the currently loaded lane (if any) and
+        load `cur_lane`, heating/cooling extruders and handling infinite
+        runout along the way.
+
+        :param cur_lane: lane to change into
+        :param purge_length: amount of filament to poop, passed through to TOOL_LOAD
+        :param restore_pos: set False to skip restoring the toolhead position after loading
+        :param new_extruder_temp: temperature to heat the new extruder to before loading
+        :param gcmd: command context to run macros through, if any
+        """
         try:
             self.afcDeltaTime.set_start_time()
             # Check if the bypass filament sensor detects filament; if so, abort the tool change.
-            if self._check_bypass(unload=False):
+            if self._check_bypass(unload=False, gcmd=gcmd):
                 return
 
             self.next_lane_load = cur_lane.name
@@ -2629,9 +2732,10 @@ class afc:
                 # Heat the next extruder FIRST so that _heat_next_extruder reads the
                 # current target temperature before it is changed by the cooldown below.
                 next_temp = None if infinite_runout else new_extruder_temp
-                result = self._heat_next_extruder(wait=False, next_temp=next_temp)
+                result = self._heat_next_extruder(wait=False, next_temp=next_temp, gcmd=gcmd)
                 if not result:
-                    self.error.fix("Failed to select or heat next extruder", self.next_lane_load)
+                    self.error.fix("Failed to select or heat next extruder", self.next_lane_load,
+                                   gcmd=gcmd)
                     return
                 if infinite_runout:
                     cur_lane.status = AFCLaneState.LOADED
@@ -2655,6 +2759,9 @@ class afc:
                 # Set the in_toolchange flag to prevent overwriting the saved position during potential failures.
                 self.in_toolchange = True
 
+                current_lane_name: Optional[str] = None
+                unload_lane: Optional[AFCLane] = None
+
                 # Check if the lane has completed the preparation process required for tool changes.
                 if cur_lane._afc_prep_done:
                     # Log the tool change operation for debugging or informational purposes.
@@ -2668,23 +2775,24 @@ class afc:
                     if current_lane_name is not None:
                         unload_lane = self.lanes.get(current_lane_name, None)
                         if unload_lane is None:
-                            self.error.AFC_error('{} Unknown'.format(current_lane_name))
+                            self.error.AFC_error('{} Unknown'.format(current_lane_name), gcmd=gcmd)
                             return
                         force_unload = (infinite_runout and not unload_lane.extruder_obj.is_standalone())
                         if not self.TOOL_UNLOAD(unload_lane, set_start_time=False,
-                                                force_unload=force_unload):
+                                                force_unload=force_unload, gcmd=gcmd):
                             # Abort if the unloading process fails.
                             msg = (' UNLOAD ERROR NOT CLEARED')
-                            self.error.fix(msg, unload_lane)  #send to error handling
+                            self.error.fix(msg, unload_lane, gcmd=gcmd)  #send to error handling
                             # Error happened, reset toolchanges without error count
                             # and increase unload error count
-                            self.afc_stats.increase_unload_error_count(self)
+                            if self.afc_stats is not None:
+                                self.afc_stats.increase_unload_error_count(self)
                             return
 
                         if (force_unload
                             and not unload_lane.is_direct_hub()):
                             # Eject spool before loading next lane for infinite rollover
-                            self.LANE_UNLOAD(unload_lane)
+                            self.LANE_UNLOAD(unload_lane, gcmd=gcmd)
 
                 if adjusting_temperature:
                     # Now cool down last lanes extruder only when doing infinite runout since
@@ -2701,8 +2809,8 @@ class afc:
                         and self.park
                         and self.park_cmd is not None):
                         self.logger.info("Parking while waiting for extruder to heat.")
-                        self.gcode.run_script_from_command(
-                            f"{self.park_cmd} EXTRUDER={unload_lane.extruder_obj.name}"
+                        self.run_script(
+                            f"{self.park_cmd} EXTRUDER={unload_lane.extruder_obj.name}", gcmd=gcmd
                         )
 
                     next_heater = next_extruder_obj.get_heater()
@@ -2715,28 +2823,30 @@ class afc:
                         and self.wipe
                         and self.wipe_cmd is not None):
                         self.logger.info("Wiping ooze...")
-                        self.gcode.run_script_from_command(
-                            f"{self.wipe_cmd} EXTRUDER={unload_lane.extruder_obj.name}"
-                        )
+                        self.run_script(
+                            f"{self.wipe_cmd} EXTRUDER={unload_lane.extruder_obj.name}", gcmd=gcmd)
 
                 # Load the new lane and restore the toolhead position if successful.
-                if self.TOOL_LOAD(cur_lane, purge_length, set_start_time=False) and not self.error_state:
+                if (self.TOOL_LOAD(cur_lane, purge_length, set_start_time=False, gcmd=gcmd)
+                    and not self.error_state):
                     if restore_pos:
                         self.restore_pos()
                     total_time = self.afcDeltaTime.log_total_time("Total change time:")
-                    self.afc_stats.average_toolchange_time.average_time(total_time)
+                    if self.afc_stats is not None:
+                        self.afc_stats.average_toolchange_time.average_time(total_time)
                     self.in_toolchange = False
                     cur_lane.extruder_obj.estats.increase_toolcount_change()
                 else:
                     # Error happened, reset toolchanges without error count
                     # and increase load error count
-                    self.afc_stats.increase_load_error_count(self)
+                    if self.afc_stats is not None:
+                        self.afc_stats.increase_load_error_count(self)
             else:
                 # Calling handle activate extruder just to make sure lanes are synced as tool
                 # could have been changed with KTC SELECT_TOOL and lane might not be synced
                 # properly
                 # Take call out once transitioned away from KTC
-                self.function._handle_activate_extruder(0)
+                self.function.handle_activate_extruder(0, gcmd=gcmd)
                 self.logger.info("{} already loaded".format(cur_lane.name))
                 if not self.error_state and self.current_toolchange == -1:
                     self.current_toolchange += 1
@@ -2747,7 +2857,7 @@ class afc:
             self.logger.error("Unexpected error during CHANGE_TOOL:\n", traceback=trace)
             self.error.AFC_error(
                 "An unexpected error occurred during CHANGE_TOOL. Please check the logs and report this issue to developers.",
-                pause=self.function.in_print()
+                pause=self.function.in_print(), gcmd=gcmd
             )
         finally:
             self.next_lane_load = None
@@ -2983,7 +3093,9 @@ class afc:
         pheaters.set_temperature(heater, temp, should_wait)
         self.logger.debug("Done setting temp")
 
-    def _heat_next_extruder(self, wait=True, next_temp: Optional[float]=None) -> Union[Tuple[AFCExtruder, float], bool]:
+    def _heat_next_extruder(
+        self, wait=True, next_temp: Optional[float]=None, *, gcmd: AFCGcmd
+    ) -> Union[Tuple[AFCExtruder, float], bool]:
         """
         Heats the next extruder if it is not the current extruder.
         This function checks if the next lane to load is specified and if it is different from the current extruder.
@@ -2993,6 +3105,7 @@ class afc:
         :param wait: Whether to wait for the next extruder to reach the target temperature before proceeding with the tool change
         :param next_temp: The temperature to set for the next extruder. If None, uses the current toolhead extruder heater's
             target temperature as the setpoint for the next extruder.
+        :param gcmd: command context to run the pause through, if any
         :return: A tuple of the next extruder object and the target temperature if successful, or False if there was an error
         """
         # Check if the current extruder is loaded with the lane to be unloaded.
@@ -3000,7 +3113,8 @@ class afc:
             next_extruder = self.lanes[self.next_lane_load].extruder_obj
         else:
             # Add correct error state if next lane load is None
-            self.error.AFC_error("Next lane load is None, cannot proceed with tool change", pause=self.function.in_print())
+            self.error.AFC_error("Next lane load is None, cannot proceed with tool change",
+                                 pause=self.function.in_print(), gcmd=gcmd)
             next_extruder = None
             return False
 
@@ -3121,6 +3235,9 @@ class afc:
         """
         short = bool(gcmd.get_int("SHORT", self.short_stats))
 
+        if self.afc_stats is None:
+            self.logger.info("AFC stats are not available, Moonraker never connected.")
+            return
         self.afc_stats.print_stats(afc_obj=self, short=short)
 
     cmd_AFC_CHANGE_BLADE_help = "Sets cutter blade changed date and resets total count since blade was changed"
@@ -3190,7 +3307,7 @@ class afc:
             self.logger.info(f'Extruder stats reset for {extruder.name}')
 
         if extruder or lane:
-            if not self.db_backup:
+            if not self.db_backup and self.moonraker is not None:
                 error = self.moonraker.trigger_db_backup()
                 if error: return
                 self.db_backup = True
@@ -3199,8 +3316,9 @@ class afc:
             if "all" in extruder.lower():
                 for extruder_obj in self.tools.values():
                     reset_extruder(extruder_obj)
-                self.afc_stats.average_tool_load_time.reset_count()
-                self.afc_stats.reset_average_times()
+                if self.afc_stats is not None:
+                    self.afc_stats.average_tool_load_time.reset_count()
+                    self.afc_stats.reset_average_times()
             else:
                 extruder_obj: AFCExtruder = self.tools.get(extruder, None)
                 if extruder_obj:

@@ -17,13 +17,14 @@ import inspect
 
 from configparser import Error as error
 
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 if TYPE_CHECKING:
     from extras.AFC import afc
     from extras.AFC_lane import AFCLane
     from extras.AFC_stepper import AFCExtruderStepper
     from gcode import GCodeCommand
+    from extras.AFC_utils import AFCGcmd
     from configfile import ConfigWrapper
     from mcu import MCU_adc
 
@@ -36,6 +37,8 @@ ADVANCING_STATE_NAME = "Advancing"
 NEUTRAL_STATE_NAME = "Neutral"
 CHECK_RUNOUT_TIMEOUT = 0.5
 FPS_ENDSTOP_POLL_TIME = 0.01  # 10ms poll interval for software endstop
+
+FPS_PSF_TYPES = ["FPS_PSF", "COMP"]
 
 class AFCBuffer:
     def __init__(self, config):
@@ -282,18 +285,19 @@ class AFCBuffer:
             and self.filament_error_pos is not None):
             if extruder_pos > self.filament_error_pos:
                 msg = "AFC filament fault detected! Take necessary action."
-                self.pause_on_error(msg, True)
+                self.pause_on_error(msg, True, gcmd="callback")
                 # Update error position after triggering to prevent repeated triggers
                 self.update_filament_error_pos()
 
         return eventtime + CHECK_RUNOUT_TIMEOUT
 
-    def pause_on_error(self, msg, pause=False):
+    def pause_on_error(self, msg: str, pause: bool=False, *, gcmd: AFCGcmd) -> None:
         """
         Pause the print with an error message if fault is detected, prevents duplicate triggers.
 
         :param msg: Error message to display
         :param pause: Boolean, if True triggers pause with error message
+        :param gcmd: command context the pause is run through
         """
         eventtime = self.reactor.monotonic()
         if (eventtime < self.min_event_systime
@@ -305,7 +309,7 @@ class AFCBuffer:
                 msg += '\nCLOG DETECTED'
             if self.last_state == ADVANCING_STATE_NAME:
                 msg += '\nAFC NOT FEEDING'
-            self.afc.error.AFC_error( msg, True )
+            self.afc.error.AFC_error( msg, True, gcmd=gcmd)
 
     def enable_buffer(self, lane: AFCLane):
         """
@@ -774,6 +778,12 @@ class AFCFPSBuffer(AFCBuffer):
         self.sample_time: float = config.getfloat('sample_time', 0.005)
         self.report_time: float = config.getfloat('report_time', 0.100)
         self.reversed: bool = config.getboolean('reversed', False)
+        self.adc_min_val: float = config.getfloat('adc_min_val', 0.0)
+        self.adc_max_val: float = config.getfloat('adc_max_val', 1.0)
+        if self.adc_max_val <= self.adc_min_val:
+            error_str = (f"adc_max_val ({self.adc_max_val}) must be greater than "
+                        f"adc_min_val ({self.adc_min_val}) in section '{config.get_name()}'")
+            raise config.error(error_str)
 
         # Setup ADC sampling — handle both Klipper and Kalico APIs
         if hasattr(self.adc, "setup_minmax"): # Kalico has this
@@ -800,6 +810,7 @@ class AFCFPSBuffer(AFCBuffer):
         # are accepted alongside set_point/low_point/high_point. If both
         # are specified, the primary name takes precedence.
         self.fps_value: float = 0.0
+        self.raw_value: float = 0.0
         _sp_default = config.getfloat('neutral_point', 0.5, minval=0.1, maxval=0.9)
         self.set_point: float = config.getfloat('set_point', _sp_default, minval=0.1, maxval=0.9)
         _lp_default = config.getfloat('max_tension', 0.1, minval=0.0, maxval=0.5)
@@ -904,11 +915,47 @@ class AFCFPSBuffer(AFCBuffer):
         self.fps_trailing_endstop: PollingEndstopWrapper = PollingEndstopWrapper(
             self.reactor, self.adc.get_mcu, lambda: self.buffer_trailing_triggered,
             poll_time=FPS_ENDSTOP_POLL_TIME)
+        self._lane_fps_endstops: Dict[str, PollingEndstopWrapper] = {}
+        self._lane_fps_trailing_endstops: Dict[str, PollingEndstopWrapper] = {}
 
         # Register macros
         self.gcode.register_mux_command("AFC_SET_FPS_SET_POINT", "BUFFER", self.name,
                                         self.cmd_AFC_SET_FPS_SET_POINT,
                                         desc=self.cmd_AFC_SET_FPS_SET_POINT_help)
+
+    def get_fps_endstop_for_lane(self, lane_name: str) -> PollingEndstopWrapper:
+        """
+        Return a per-lane PollingEndstopWrapper that polls this buffer's advance
+        (high_point) threshold, creating and registering one on first use. Lanes
+        sharing this buffer must each call this instead of adding their stepper
+        directly to `fps_endstop`, so one lane's homing move doesn't pull in
+        other lanes' steppers via a shared stepper list.
+
+        :param lane_name: Name of the lane requesting its own endstop.
+        :return PollingEndstopWrapper: Per-lane endstop for the advance threshold.
+        """
+        if lane_name not in self._lane_fps_endstops:
+            query_endstops = self.printer.lookup_object('query_endstops')
+            endstop_name = f"{lane_name}_buffer"
+            self._lane_fps_endstops[lane_name] = self.fps_endstop.for_stepper(
+                endstop_name, query_endstops)
+        return self._lane_fps_endstops[lane_name]
+
+    def get_fps_trailing_endstop_for_lane(self, lane_name: str) -> PollingEndstopWrapper:
+        """
+        Return a per-lane PollingEndstopWrapper that polls this buffer's trailing
+        (low_point) threshold, creating and registering one on first use. See
+        `get_fps_endstop_for_lane` for why lanes must not share one directly.
+
+        :param lane_name: Name of the lane requesting its own endstop.
+        :return PollingEndstopWrapper: Per-lane endstop for the trailing threshold.
+        """
+        if lane_name not in self._lane_fps_trailing_endstops:
+            query_endstops = self.printer.lookup_object('query_endstops')
+            endstop_name = f"{lane_name}_buffer_trailing"
+            self._lane_fps_trailing_endstops[lane_name] = self.fps_trailing_endstop.for_stepper(
+                endstop_name, query_endstops)
+        return self._lane_fps_trailing_endstops[lane_name]
 
     def _check_deadband(self, set_point: float, deadband: float) -> str:
         """
@@ -976,6 +1023,9 @@ class AFCFPSBuffer(AFCBuffer):
         elif read_value is None:
             read_value = read_time
             read_time = self.reactor.monotonic()
+        self.raw_value = read_value
+        read_value = (read_value - self.adc_min_val) / (self.adc_max_val - self.adc_min_val)
+        read_value = max(0.0, min(1.0, read_value))
 
         if self.reversed:
             read_value = 1.0 - read_value
@@ -1383,7 +1433,7 @@ class AFCFPSBuffer(AFCBuffer):
                 return eventtime + CHECK_RUNOUT_TIMEOUT
             if extruder_pos > self.filament_error_pos:
                 msg = "AFC FPS buffer filament fault detected! Take necessary action."
-                self.pause_on_error(msg, True)
+                self.pause_on_error(msg, True, gcmd="callback")
                 self.update_filament_error_pos()
 
         return eventtime + CHECK_RUNOUT_TIMEOUT
@@ -1414,9 +1464,10 @@ class AFCFPSBuffer(AFCBuffer):
 
         buffer_status = self.buffer_status()
         state_info = "{}{}".format(buffer_status, state_mapping.get(buffer_status, ''))
-        state_info += "\n{} raw: {:.3f}  smoothed: {:.3f}  set_point: {:.2f}".format(
-            self.type, self.fps_value, self.smoothed_fps, self.set_point
-        )
+        state_info += f"\n{self.type} raw: {self.raw_value:.3f}"
+        if self.reversed:
+            state_info += f" raw flipped: {self.fps_value:.3f}"
+        state_info += f" smoothed: {self.smoothed_fps:.3f} set_point: {self.set_point:.2f}"
 
         if self.enable and self.current_lane is not None:
             if self.current_lane.extruder_stepper is not None:
@@ -1479,6 +1530,7 @@ class AFCFPSBuffer(AFCBuffer):
 
         response = super().get_status(eventtime)
 
+        response['raw_value'] = self.raw_value
         response['fps_value'] = round(self.fps_value, 3)
         response['smoothed_fps'] = round(self.smoothed_fps, 3)
         response['set_point'] = self.set_point
@@ -1490,8 +1542,8 @@ def load_config_prefix(config):
     if buffer_type == "switched":
         return AFCBuffer(config)
 
-    if buffer_type == "FPS_PSF":
+    if (buffer_type in FPS_PSF_TYPES):
         return AFCFPSBuffer(config)
 
-    msg = f"{buffer_type} not valid, only switched(turtleneck style) or FPS_PSF are valid options"
+    msg = f"{buffer_type} not valid, only switched(turtleneck style), FPS_PSF or COMP are valid options"
     raise error(msg)
